@@ -1,0 +1,32 @@
+# Build output (Cargo.lock IS tracked: this is an application)
+/target/
+**/*.rs.bk
+*.pdb
+
+# The binary build.ps1 drops in the repo root
+/clip4.exe
+
+# cargo fuzz
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# Runtime leftovers: crash dumps, logs, history files set aside as corrupt
+*.dmp
+*.log
+*.log.[0-9]
+*.corrupt-*
+
+# Editors and OS
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Claude Code: per-machine settings and scratch worktrees
+/.claude/settings.local.json
+/.claude/worktrees/

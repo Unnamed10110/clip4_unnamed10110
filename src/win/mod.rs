@@ -1,0 +1,24 @@
+//! Win32 layer: everything that touches handles, windows, the clipboard or the registry.
+pub mod app;
+pub mod blob;
+pub mod clipboard;
+pub mod commands;
+pub mod crash;
+pub mod dialogs;
+pub mod dpapi;
+pub mod gfx;
+pub mod hook;
+pub mod log;
+pub mod msg;
+pub mod overlay;
+pub mod paste;
+pub mod reg;
+pub mod settings;
+pub mod sha1;
+pub mod snippets_store;
+pub mod sound;
+pub mod tray;
+pub mod uia;
+pub mod util;
+pub mod wic;
+pub mod worker;

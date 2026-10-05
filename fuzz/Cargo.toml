@@ -1,0 +1,26 @@
+[package]
+name = "clip4-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+clip4 = { path = ".." }
+
+[[bin]]
+name = "history_parser"
+path = "fuzz_targets/history_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "clip2_importer"
+path = "fuzz_targets/clip2_importer.rs"
+test = false
+doc = false
+
+[workspace]
