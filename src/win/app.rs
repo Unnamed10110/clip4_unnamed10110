@@ -101,7 +101,7 @@ pub fn run() -> i32 {
     let settings = Settings::load_with_import();
     super::log::init(settings.debug_log);
     crash::install();
-    crate::log_info!("clip4 {} starting", env!("CARGO_PKG_VERSION"));
+    crate::log_info!("{} starting", crate::VERSION_STRING);
 
     // A successor started by a crash/restart waits for its predecessor to exit.
     if let Some(pid) = std::env::args().find_map(|a| a.strip_prefix("--after=").and_then(|v| v.parse::<u32>().ok())) {

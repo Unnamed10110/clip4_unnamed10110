@@ -14,7 +14,7 @@ Requirements: Windows 10 1809+/11, the stable Rust toolchain with the MSVC targe
 Windows SDK (for `rc.exe`, used by the build script to embed the icon and manifest).
 
 ```powershell
-.\build.ps1                    # release build; puts clip4.exe in the repo root
+.\build.ps1                    # release build; puts clip4.exe in the repo root (checked to carry Cargo.toml's version)
 cargo build --release          # -> target\release\clip4.exe (single file, no installer)
 cargo test                     # unit tests (pure logic, parsers, fuzz-style loops)
 cargo test --test integration -- --ignored --test-threads=1
@@ -25,12 +25,16 @@ cargo run --release            # start it; look for the tray icon
 To publish a GitHub release (needs the GitHub CLI, logged in with `gh auth login`, and a pushed commit):
 
 ```powershell
-.\publish_github.ps1 -DryRun   # build, package dist\clip4-v<version>-windows-x64.zip (+ .sha256), check everything
-.\publish_github.ps1           # same, then asks before creating release v<version> from Cargo.toml's version
+.\publish_github.ps1 v1.2.0 -DryRun   # build, package dist\clip4-v1.2.0-windows-x64.zip (+ .sha256), check everything
+.\publish_github.ps1 v1.2.0           # same, then asks before publishing release v1.2.0
+.\publish_github.ps1                  # no tag: releases the version Cargo.toml already has
 ```
 
-Options: `-NotesFile`/`-Notes`, `-Draft`, `-Prerelease`, `-Update` (replace the assets of an existing
-release), `-Yes`. Bump `version` in `Cargo.toml` (and commit and push) before each new release.
+The tag (`v1.2.0` or `1.2.0`; a suffix such as `1.2.0-rc.1` makes it a pre-release) is the first
+parameter. If it differs from `Cargo.toml`, the script bumps `Cargo.toml` + `Cargo.lock` so the
+binary reports the version it ships as, and commits and pushes that bump only after you confirm
+(a dry run, a cancel or a failure restores both files). Other options: `-NotesFile`/`-Notes`,
+`-Draft`, `-Prerelease`, `-NoBump`, `-Update` (replace the assets of an existing release), `-Yes`.
 
 Tip: if the repository lives in a synced folder (OneDrive), build with
 `CARGO_TARGET_DIR=%TEMP%\clip4-target` to keep build output out of the sync.

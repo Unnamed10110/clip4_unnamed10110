@@ -12,5 +12,9 @@ pub mod store;
 pub mod theme;
 pub mod transform;
 
+/// "clip4 <version>": logged at startup, and what the build scripts look for in the binary to be
+/// sure it was built from the version in Cargo.toml.
+pub const VERSION_STRING: &str = concat!("clip4 ", env!("CARGO_PKG_VERSION"));
+
 // ---- Win32 layer and application ----
 pub mod win;
