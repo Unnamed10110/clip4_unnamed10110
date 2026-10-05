@@ -30,3 +30,6 @@ desktop.ini
 # Claude Code: per-machine settings and scratch worktrees
 /.claude/settings.local.json
 /.claude/worktrees/
+
+# Release packages made by publish_github.ps1
+/dist/

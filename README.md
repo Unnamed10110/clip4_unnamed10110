@@ -22,6 +22,16 @@ cargo test --test integration -- --ignored --test-threads=1
 cargo run --release            # start it; look for the tray icon
 ```
 
+To publish a GitHub release (needs the GitHub CLI, logged in with `gh auth login`, and a pushed commit):
+
+```powershell
+.\publish_github.ps1 -DryRun   # build, package dist\clip4-v<version>-windows-x64.zip (+ .sha256), check everything
+.\publish_github.ps1           # same, then asks before creating release v<version> from Cargo.toml's version
+```
+
+Options: `-NotesFile`/`-Notes`, `-Draft`, `-Prerelease`, `-Update` (replace the assets of an existing
+release), `-Yes`. Bump `version` in `Cargo.toml` (and commit and push) before each new release.
+
 Tip: if the repository lives in a synced folder (OneDrive), build with
 `CARGO_TARGET_DIR=%TEMP%\clip4-target` to keep build output out of the sync.
 
