@@ -1,6 +1,6 @@
 [package]
 name = "clip4"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Windows clipboard manager (rewrite of clip2)"
 license = "MIT"
