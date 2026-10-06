@@ -394,22 +394,33 @@ impl App {
             }
         }
         if !self.loaded.get() {
+            // History is still loading: acknowledge the copy now, add it to the history afterwards.
+            self.click();
             self.pending_adds.borrow_mut().push(item);
             return;
         }
         self.add_item(item, true);
     }
 
+    /// The capture click, unless the user muted it. Fire-and-forget (own thread): never delays capture.
+    fn click(&self) {
+        if self.settings.borrow().sound {
+            sound::click();
+        }
+    }
+
     pub fn add_item(&self, item: Item, with_sound: bool) -> Option<u64> {
         let outcome = self.store.borrow_mut().add(item);
+        // Every copy the user makes gets its click — also a repeat of what is already on top: the
+        // history drops that duplicate, but the user still copied and expects the feedback.
+        if with_sound {
+            self.click();
+        }
         let id = match outcome {
             AddOutcome::Added(id) | AddOutcome::MovedToTop(id) => Some(id),
             AddOutcome::Duplicate => None,
         };
         if id.is_some() {
-            if with_sound && self.settings.borrow().sound {
-                sound::click(); // fire-and-forget, after the capture is complete
-            }
             self.schedule_save();
             self.overlay.refresh(self);
         }

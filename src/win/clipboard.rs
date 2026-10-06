@@ -376,6 +376,8 @@ pub fn capture(owner: Option<HWND>) -> Captured {
 
     let mut formats: Vec<(FormatKey, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
+    // Formats the source failed to hand over (busy owner, delayed rendering that returned nothing).
+    let mut unreadable = 0usize;
     for (i, (id, key)) in plan.iter().enumerate() {
         let is_primary_image = key.is_std(CF_DIBV5) || key.is_std(CF_DIB) || key.is_std(CF_BITMAP);
         let image_is_primary = is_primary_image && !has(CF_UNICODETEXT) && !has(CF_TEXT) && !has(CF_HDROP);
@@ -384,7 +386,10 @@ pub fn capture(owner: Option<HWND>) -> Captured {
             continue;
         }
         // SAFETY: clipboard is open.
-        let Ok(h) = (unsafe { GetClipboardData(*id) }) else { continue };
+        let Ok(h) = (unsafe { GetClipboardData(*id) }) else {
+            unreadable += 1;
+            continue;
+        };
         let r = if key.is_std(CF_BITMAP) {
             bitmap_to_dib(h, cap)
         } else if key.is_std(CF_UNICODETEXT) {
@@ -408,7 +413,10 @@ pub fn capture(owner: Option<HWND>) -> Captured {
                 formats.push((k, b));
             }
             Read::TooBig(n) => crate::log_info!("format {} skipped: {} bytes over limit (#{i})", key.label(), n),
-            Read::Fail => crate::log_dbg!("format {} unreadable", key.label()),
+            Read::Fail => {
+                unreadable += 1;
+                crate::log_dbg!("format {} unreadable", key.label());
+            }
         }
     }
     drop(guard);
@@ -417,6 +425,12 @@ pub fn capture(owner: Option<HWND>) -> Captured {
         crate::log_warn!("clipboard lock held {lock_ms} ms during capture");
     }
     if formats.is_empty() {
+        if unreadable > 0 {
+            // The source offered data but would not give it up right now: try again shortly (the
+            // retry timer is bounded) instead of silently losing the copy.
+            crate::log_info!("capture of sequence {seq}: {unreadable} format(s) unreadable; will retry");
+            return Captured::Busy;
+        }
         return Captured::Empty(seq);
     }
     Captured::Ok(Snapshot { seq, formats, lock_ms })

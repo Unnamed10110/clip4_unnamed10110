@@ -81,7 +81,10 @@ Tray menu: Show clipboard, Copy from focused control, Snippets, Start with Windo
 Expand selected item, Settings, Restart, Exit.
 
 Anything your password manager marks with `ExcludeClipboardContentFromMonitorProcessing`,
-`CanIncludeInClipboardHistory = 0` or `Clipboard Viewer Ignore` is never recorded.
+`CanIncludeInClipboardHistory = 0` or `Clipboard Viewer Ignore` is never recorded (and makes no sound).
+
+Every copy you make plays a short click — including copying the same thing again, which the
+history keeps as one entry. Your own pastes from clip4 do not click. Mute it in Settings.
 
 ## Settings
 
