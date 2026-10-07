@@ -76,6 +76,79 @@ fn is_text_only(it: &Item) -> bool {
     it.kind == Kind::Text && it.payload_std(CF_HDROP).is_none()
 }
 
+/// Text whose formatting survives being merged into one payload: plain text, or an HTML fragment
+/// that carries its own inline styles (what browsers write). RTF, Office-style HTML (its styles sit
+/// in a `<style>` block that a merge would drop), images, files and any other format are not merged.
+fn merges_cleanly(it: &Item) -> bool {
+    is_text_only(it)
+        && text_of(it).is_some()
+        && it.formats.iter().all(|(k, p)| {
+            k.is_std(CF_UNICODETEXT)
+                || k.is_std(CF_TEXT)
+                || k.is_std(CF_OEMTEXT)
+                || k.is_std(CF_LOCALE)
+                || (k.is_named(FMT_HTML) && p.bytes().is_some_and(|b| !has_style_block(b)))
+        })
+}
+
+fn has_style_block(html: &[u8]) -> bool {
+    html.windows(6).any(|w| w.eq_ignore_ascii_case(b"<style"))
+}
+
+/// `formats` with a line break inside the same payloads (CRLF in the text, `<br>` in the HTML,
+/// `\par` in the RTF), so a multi-paste needs no separator paste of its own: that second clipboard
+/// swap + Ctrl+V is what some targets dropped, gluing items together. Text that already ends a line
+/// is kept as it is. None when a payload cannot be extended (on disk, malformed) or there is no text.
+fn with_line_break(formats: &Formats) -> Option<Formats> {
+    let mut out = Formats::new();
+    let mut has_text = false;
+    for (k, p) in formats {
+        let payload = if k.is_std(CF_UNICODETEXT) {
+            has_text = true;
+            let t = preview::decode_unicode(p.bytes()?);
+            if t.ends_with('\n') {
+                return Some(formats.clone());
+            }
+            Payload::inline(preview::unicode_bytes(&(t + "\r\n")))
+        } else if k.is_std(CF_TEXT) {
+            has_text = true;
+            let b = p.bytes()?;
+            if preview::decode_ansi(b).ends_with('\n') {
+                return Some(formats.clone());
+            }
+            let mut v = b.split(|&c| c == 0).next().unwrap_or_default().to_vec();
+            v.extend_from_slice(b"\r\n\0");
+            Payload::inline(v)
+        } else if k.is_named(FMT_HTML) {
+            Payload::inline(transform::html_append_br(p.bytes()?)?)
+        } else if k.is_named(FMT_RTF) {
+            Payload::inline(transform::rtf_append_par(p.bytes()?)?)
+        } else {
+            p.clone()
+        };
+        out.push((k.clone(), payload));
+    }
+    has_text.then_some(out)
+}
+
+/// The clipboard states a multi-paste goes through: every item with ALL its own formats, a line
+/// break after each but the last (inside the item's own payloads when possible, else a state of
+/// its own).
+fn sequence_steps(items: &[Item]) -> Vec<Formats> {
+    let mut steps = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        if i + 1 == items.len() {
+            steps.push(it.formats.clone());
+        } else if let Some(f) = is_text_only(it).then(|| with_line_break(&it.formats)).flatten() {
+            steps.push(f);
+        } else {
+            steps.push(it.formats.clone());
+            steps.push(text_formats("\r\n"));
+        }
+    }
+    steps
+}
+
 impl App {
     /// Where a paste should land: the window the user was in before the overlay opened.
     fn paste_target(&self) -> HWND {
@@ -250,12 +323,14 @@ impl App {
             Cmd::OpenUrl => {
                 if let Some(t) = text_of(&items[0]).map(|t| t.trim().to_string()) {
                     let lower = t.to_ascii_lowercase();
-                    if (lower.starts_with("http://") || lower.starts_with("https://")) && !t.contains(char::is_whitespace) {
+                    if (lower.starts_with("http://") || lower.starts_with("https://")) && !t.contains(|c: char| c.is_whitespace() || c == '"') {
                         self.close_overlay();
-                        let w = wide(&t);
+                        // Through explorer.exe, so the browser starts in the user's normal context
+                        // instead of inheriting clip4's elevation.
+                        let w = wide(&format!("\"{t}\""));
                         // SAFETY: shell open of an http(s) URL only.
                         unsafe {
-                            ShellExecuteW(None, windows::core::w!("open"), pcw(&w), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                            ShellExecuteW(None, windows::core::w!("open"), windows::core::w!("explorer.exe"), pcw(&w), PCWSTR::null(), SW_SHOWNORMAL);
                         }
                     }
                 }
@@ -299,18 +374,25 @@ impl App {
     }
 
     fn multi_paste(&self, items: &[Item]) {
-        if items.iter().all(is_text_only) {
-            // All text/RTF/HTML: merge into one payload, paste once, and keep the merge in history.
+        if items.iter().all(merges_cleanly) {
+            // Plain text and self-contained browser HTML: one payload, ONE paste (fast, and the line
+            // breaks cannot get lost). The merge is kept in history.
             let f = merged_formats(items);
             let text = f.first().and_then(|(_, p)| p.bytes()).map(preview::decode_unicode);
             self.add_item(Item::new(0, now_unix_ms(), false, f.clone()), false);
             self.submit_paste(f, text, false);
         } else {
-            // Mixed: one clipboard swap per item, CRLF after non-text items; the user's clipboard is restored.
+            // Office/RTF text, images, files: a merged RTF/HTML payload would lose formatting (the
+            // first item's font and colour tables win; Office HTML loses its <style> block), so each
+            // item is pasted with ALL its own formats, one clipboard swap per item, and the user's
+            // clipboard is restored afterwards.
+            if items.iter().all(is_text_only) {
+                // The combined text is still kept in history as one item.
+                self.add_item(Item::new(0, now_unix_ms(), false, merged_formats(items)), false);
+            }
             let target = self.paste_target();
             self.close_overlay();
-            let steps: Vec<Formats> = items.iter().map(|i| i.formats.clone()).collect();
-            let _ = self.paster.submit(Job::Sequence { steps, target: SendHwnd::new(target) });
+            let _ = self.paster.submit(Job::Sequence { steps: sequence_steps(items), target: SendHwnd::new(target) });
         }
     }
 
@@ -481,5 +563,75 @@ pub fn snippet_formats(s: &Snippet, now: &Now, clip: &str) -> Vec<(FormatKey, Pa
         f
     } else {
         text_formats(&sf::expand(&s.content, now, clip))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(formats: Vec<(FormatKey, Payload)>) -> Item {
+        Item::new(1, 0, false, formats)
+    }
+
+    fn text(s: &str) -> (FormatKey, Payload) {
+        (FormatKey::Standard(CF_UNICODETEXT), Payload::inline(preview::unicode_bytes(s)))
+    }
+
+    fn html(fragment: &str) -> (FormatKey, Payload) {
+        (FormatKey::reg(FMT_HTML), Payload::inline(transform::make_html_format(fragment)))
+    }
+
+    fn rtf(s: &str) -> (FormatKey, Payload) {
+        (FormatKey::reg(FMT_RTF), Payload::inline(s.as_bytes().to_vec()))
+    }
+
+    fn unicode_of(f: &Formats) -> String {
+        preview::decode_unicode(f.iter().find(|(k, _)| k.is_std(CF_UNICODETEXT)).and_then(|(_, p)| p.bytes()).unwrap())
+    }
+
+    #[test]
+    fn plain_text_and_self_contained_html_merge() {
+        assert!(merges_cleanly(&item(vec![text("hello")])));
+        assert!(merges_cleanly(&item(vec![text("hello"), html("<span style=\"color: red\">hello</span>")])), "browser HTML keeps its inline styles");
+        let office = (FormatKey::reg(FMT_HTML), Payload::inline(b"Version:0.9\r\n<html><head><STYLE>.xl65{color:red}</STYLE></head>".to_vec()));
+        assert!(!merges_cleanly(&item(vec![text("hello"), office])), "a merge would drop the <style> block");
+        assert!(!merges_cleanly(&item(vec![text("hello"), rtf("{\\rtf1 hello}")])), "a merged RTF keeps only the first item's tables");
+        let on_disk = item(vec![(FormatKey::Standard(CF_UNICODETEXT), Payload::OnDisk { sha1: [0; 20], len: 300_000 })]);
+        assert!(!merges_cleanly(&on_disk), "big text lives on disk: only the paste thread can read it");
+    }
+
+    #[test]
+    fn a_line_break_goes_into_every_payload() {
+        let f = vec![text("hello"), html("<b>hello</b>"), rtf("{\\rtf1 hello}")];
+        let g = with_line_break(&f).unwrap();
+        assert_eq!(unicode_of(&g), "hello\r\n");
+        let h = g.iter().find(|(k, _)| k.is_named(FMT_HTML)).and_then(|(_, p)| p.bytes()).unwrap();
+        assert_eq!(preview::html_fragment(h).unwrap(), "<b>hello</b><br>");
+        let r = g.iter().find(|(k, _)| k.is_named(FMT_RTF)).and_then(|(_, p)| p.bytes()).unwrap();
+        assert_eq!(r, b"{\\rtf1 hello\\par }");
+        // Already ends a line (an Excel cell): unchanged.
+        let cell = vec![text("hello\r\n"), html("<b>hello</b>")];
+        assert_eq!(unicode_of(&with_line_break(&cell).unwrap()), "hello\r\n");
+        // A payload that cannot be extended: the caller pastes a separator of its own.
+        let big = vec![text("hello"), (FormatKey::reg(FMT_HTML), Payload::OnDisk { sha1: [0; 20], len: 300_000 })];
+        assert!(with_line_break(&big).is_none());
+        assert!(with_line_break(&vec![html("x")]).is_none(), "no text, no break");
+    }
+
+    #[test]
+    fn a_multi_paste_has_a_line_break_after_every_item_but_the_last() {
+        let a = item(vec![text("one"), rtf("{\\rtf1 one}")]);
+        let b = item(vec![text("two"), rtf("{\\rtf1 two}")]);
+        let c = item(vec![text("three"), rtf("{\\rtf1 three}")]);
+        let steps = sequence_steps(&[a, b, c]);
+        assert_eq!(steps.len(), 3, "the break travels inside the items: no separator states");
+        assert_eq!([unicode_of(&steps[0]), unicode_of(&steps[1]), unicode_of(&steps[2])], ["one\r\n", "two\r\n", "three"]);
+        // An image has no text to extend: it gets a separator state of its own.
+        let img = item(vec![(FormatKey::Standard(CF_DIB), Payload::inline(vec![0u8; 64]))]);
+        let steps = sequence_steps(&[img, item(vec![text("after")])]);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(unicode_of(&steps[1]), "\r\n");
+        assert_eq!(unicode_of(&steps[2]), "after");
     }
 }

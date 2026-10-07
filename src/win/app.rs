@@ -51,6 +51,9 @@ pub struct CapState {
     retry_seq: u32,
     attempts: u32,
     pending: Option<u32>,
+    /// Sequence whose copy already got its click (played on the change notification).
+    clicked_seq: u32,
+    last_click: Option<Instant>,
 }
 
 pub struct App {
@@ -207,7 +210,11 @@ impl App {
             match CreateWindowExW(WINDOW_EX_STYLE(0), MAIN_CLASS, w!("clip4"), WS_POPUP, 0, 0, 0, 0, None, None, Some(self.hinst), None) {
                 Ok(h) => {
                     self.hwnd.set(h);
-                    self.taskbar_created.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+                    let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+                    self.taskbar_created.set(taskbar_created);
+                    // clip4 runs elevated: without this, Windows drops Explorer's TaskbarCreated
+                    // broadcast (UIPI) and the tray icon is not restored after Explorer restarts.
+                    let _ = ChangeWindowMessageFilterEx(h, taskbar_created, MSGFLT_ALLOW, None);
                     true
                 }
                 Err(e) => {
@@ -346,10 +353,41 @@ impl App {
                 c.attempts = 0;
             }
         }
+        self.click_on_change(seq);
         self.workers.capture(seq);
     }
 
-    fn on_capture_busy(&self, seq: u32) {
+    /// The copy click, played on the change notification itself: instant, and independent of how
+    /// long the capture takes or whether it succeeds (another app may hold the clipboard, the
+    /// source may render slowly, a newer copy may supersede this one). Every check here is
+    /// lock-free. Content that might be private (spec 20.1) gets no click here; the capture
+    /// clicks for it once it is actually recorded.
+    fn click_on_change(&self, seq: u32) {
+        if !self.settings.borrow().sound
+            || clipboard::owner_is_us()
+            || clipboard::own_write_within(1500)
+            || !clipboard::has_any_format()
+            || clipboard::looks_private()
+        {
+            return;
+        }
+        {
+            let mut c = self.cap.borrow_mut();
+            if c.clicked_seq == seq {
+                return;
+            }
+            c.clicked_seq = seq;
+            // One copy can raise two notifications in a row (Excel, some browsers): one click.
+            let now = Instant::now();
+            if c.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(120)) {
+                return;
+            }
+            c.last_click = Some(now);
+        }
+        sound::click();
+    }
+
+    fn on_capture_busy(&self, seq: u32, unreadable: bool) {
         let delay = {
             let mut c = self.cap.borrow_mut();
             if c.retry_seq != seq {
@@ -357,12 +395,12 @@ impl App {
                 c.attempts = 0;
             }
             c.attempts += 1;
-            if c.attempts > 10 {
-                crate::log_warn!("capture of sequence {seq} abandoned after 10 attempts");
+            let Some(d) = capture_retry_delay(c.attempts, unreadable) else {
+                crate::log_warn!("capture of sequence {seq} abandoned after {} attempts", c.attempts - 1);
                 return;
-            }
+            };
             c.pending = Some(seq);
-            [50u32, 100, 150, 200][(c.attempts as usize - 1).min(3)]
+            d
         };
         // SAFETY: one-shot timer (the UI thread never sleeps).
         unsafe {
@@ -370,7 +408,7 @@ impl App {
         }
     }
 
-    fn on_captured(&self, seq: u32, item: Item, lock_ms: u32) {
+    fn on_captured(&self, seq: u32, item: Item, lock_ms: u32, more: bool) {
         {
             let mut c = self.cap.borrow_mut();
             if c.last_consumed == seq {
@@ -393,13 +431,37 @@ impl App {
                 }
             }
         }
+        // The click normally played on the change notification already (click_on_change).
+        let sound = {
+            let mut c = self.cap.borrow_mut();
+            let s = c.clicked_seq != seq;
+            c.clicked_seq = seq;
+            s
+        };
         if !self.loaded.get() {
             // History is still loading: acknowledge the copy now, add it to the history afterwards.
-            self.click();
+            if sound {
+                self.click();
+            }
             self.pending_adds.borrow_mut().push(item);
             return;
         }
-        self.add_item(item, true);
+        self.add_item(item, sound);
+        if more {
+            // Added, moved to the top or a duplicate of it: in every case the copy is now item 0.
+            if let Some(id) = self.store.borrow().items().first().map(|i| i.id) {
+                self.workers.complete(seq, id);
+            }
+        }
+    }
+
+    /// Stage 2 of a capture arrived: the formats the item did not have yet.
+    fn on_completed(&self, id: u64, formats: Vec<(FormatKey, Payload)>) {
+        crate::log_dbg!("item {id}: +{} formats", formats.len());
+        if self.store.borrow_mut().replace_item(id, |it| it.with_extra(formats)) {
+            self.schedule_save();
+            self.overlay.refresh(self);
+        }
     }
 
     /// The capture click, unless the user muted it. Fire-and-forget (own thread): never delays capture.
@@ -453,8 +515,9 @@ impl App {
 
     fn on_ui_msg(&self, m: UiMsg) {
         match m {
-            UiMsg::Captured { seq, item, lock_ms } => self.on_captured(seq, item, lock_ms),
-            UiMsg::CaptureBusy { seq } => self.on_capture_busy(seq),
+            UiMsg::Captured { seq, item, lock_ms, more } => self.on_captured(seq, item, lock_ms, more),
+            UiMsg::Completed { id, formats } => self.on_completed(id, formats),
+            UiMsg::CaptureBusy { seq, unreadable } => self.on_capture_busy(seq, unreadable),
             UiMsg::CaptureConsumed { seq } => {
                 self.cap.borrow_mut().last_consumed = seq;
             }
@@ -680,6 +743,25 @@ impl App {
     }
 }
 
+/// Delay before retry `attempt` (1-based) of a capture; `None` = give up. A newer clipboard change
+/// restarts the count.
+/// - Clipboard busy (another watcher such as Flow Launcher or ShareX holds it, sometimes for
+///   seconds): about 10 s, ramping 50 ms -> 500 ms. Waiting costs nobody anything.
+/// - Data unreadable (the source announced formats but rendered none): 4 quick tries, ~2 s. Each
+///   try holds the clipboard while the source fails again, which blocks other apps' Ctrl+C.
+pub fn capture_retry_delay(attempt: u32, unreadable: bool) -> Option<u32> {
+    if unreadable {
+        const QUICK: [u32; 4] = [100, 250, 500, 1000];
+        return QUICK.get((attempt.max(1) - 1) as usize).copied();
+    }
+    const RAMP: [u32; 7] = [50, 100, 150, 200, 300, 400, 500];
+    match attempt {
+        0 => Some(RAMP[0]),
+        1..=25 => Some(RAMP.get(attempt as usize - 1).copied().unwrap_or(500)),
+        _ => None,
+    }
+}
+
 pub fn normalize(s: &str) -> String {
     s.trim().replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -768,3 +850,25 @@ unsafe fn main_proc_body(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 /// Unused when only the app module is compiled in tests.
 #[allow(dead_code)]
 fn _keep(_: VIRTUAL_KEY, _: &NOTIFYICONDATAW) {}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_retry_delay;
+
+    #[test]
+    fn capture_retry_schedule_ramps_then_gives_up_after_about_ten_seconds() {
+        assert_eq!(capture_retry_delay(1, false), Some(50));
+        assert_eq!(capture_retry_delay(2, false), Some(100));
+        assert_eq!(capture_retry_delay(7, false), Some(500));
+        assert_eq!(capture_retry_delay(25, false), Some(500));
+        assert_eq!(capture_retry_delay(26, false), None);
+        let total: u32 = (1..=25).filter_map(|a| capture_retry_delay(a, false)).sum();
+        assert!((9_000..=12_000).contains(&total), "total retry window {total} ms");
+    }
+
+    #[test]
+    fn unreadable_data_is_retried_only_briefly() {
+        let delays: Vec<u32> = (1..=10).filter_map(|a| capture_retry_delay(a, true)).collect();
+        assert_eq!(delays, vec![100, 250, 500, 1000]);
+    }
+}

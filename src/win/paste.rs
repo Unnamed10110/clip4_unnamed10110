@@ -4,7 +4,7 @@
 use super::blob::BlobStore;
 use super::clipboard::{self, Backup};
 use super::msg::{post_ui, UiMsg, WM_PASTE_WAKE};
-use super::util::{guarded, now_unix_ms, pcw, wide, SendHwnd};
+use super::util::{guarded, now_unix_ms, pcw, sleep_pump, wide, SendHwnd};
 use crate::model::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -155,30 +155,6 @@ fn thread_main(blobs: BlobStore, slot: Arc<Mutex<Option<Job>>>, busy: Arc<Busy>,
     }
 }
 
-/// Sleeps while still pumping this thread's messages (keeps clipboard-owner callbacks flowing).
-fn sleep_pump(ms: u64) {
-    let end = Instant::now() + Duration::from_millis(ms);
-    loop {
-        let now = Instant::now();
-        if now >= end {
-            break;
-        }
-        let left = (end - now).as_millis().min(u32::MAX as u128) as u32;
-        // SAFETY: wait for input or timeout, then drain.
-        unsafe {
-            MsgWaitForMultipleObjectsEx(None, left, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-            let mut m = MSG::default();
-            while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
-                if m.message == WM_QUIT {
-                    return;
-                }
-                let _ = TranslateMessage(&m);
-                DispatchMessageW(&m);
-            }
-        }
-    }
-}
-
 struct Ctx {
     hwnd: HWND,
     blobs: BlobStore,
@@ -233,7 +209,7 @@ impl Ctx {
             return Err("the item's data is no longer available".into());
         }
         let prepared = clipboard::prepare(&bytes).ok_or("could not allocate clipboard memory")?;
-        clipboard::write_prepared(self.hwnd, prepared, 24, 8).map(|_| ()).map_err(|e| format!("could not set the clipboard ({e})"))
+        clipboard::write_prepared(self.hwnd, prepared).map(|_| ()).map_err(|e| format!("could not set the clipboard ({e})"))
     }
 
     fn clipboard_paste(&self, formats: Vec<(FormatKey, Payload)>, target: HWND, restore: bool) -> R {
@@ -268,21 +244,14 @@ impl Ctx {
             sleep_pump(AFTER_FOCUS_MS);
             release_modifiers();
             sleep_pump(AFTER_MODS_MS);
-            let n = steps.len();
-            for (i, step) in steps.iter().enumerate() {
+            // The steps already carry the line breaks (see `commands::sequence_steps`).
+            for step in steps.iter() {
                 if foreground() != target {
                     return Err("the target window lost focus; paste stopped".to_string());
                 }
                 self.set_clipboard(step)?;
                 send_ctrl_v()?;
                 sleep_pump(SETTLE_AFTER_PASTE_MS / 2);
-                let text_only = step.iter().all(|(k, _)| k.is_std(CF_UNICODETEXT) || k.is_std(CF_TEXT));
-                if i + 1 < n && !text_only {
-                    let crlf = vec![(FormatKey::Standard(CF_UNICODETEXT), Payload::inline(crate::preview::unicode_bytes("\r\n")))];
-                    self.set_clipboard(&crlf)?;
-                    send_ctrl_v()?;
-                    sleep_pump(SETTLE_AFTER_PASTE_MS / 2);
-                }
             }
             Ok(())
         })();
@@ -489,7 +458,13 @@ fn tap(vk: VIRTUAL_KEY) -> R {
 
 /// Ctrl+V as ONE SendInput batch; the return count is checked.
 fn send_ctrl_v() -> R {
-    crate::log_dbg!("sending Ctrl+V; foreground is {}", clipboard::process_name_of_window(foreground()));
+    // Who holds the clipboard right now tells a failed write apart from the target's Ctrl+V
+    // losing a race with another clipboard reader (Flow Launcher, ShareX, ...).
+    crate::log_dbg!(
+        "sending Ctrl+V; foreground is {}; clipboard held by {}",
+        clipboard::process_name_of_window(foreground()),
+        clipboard::holder_name().unwrap_or_else(|| "nobody".into())
+    );
     let seq = [vk_key(VK_LCONTROL, false), vk_key(VK_V, false), vk_key(VK_V, true), vk_key(VK_LCONTROL, true)];
     let n = send(&seq);
     if n != seq.len() {

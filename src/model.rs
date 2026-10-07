@@ -231,6 +231,14 @@ impl Item {
         }
     }
 
+    /// This item plus the formats it does not have yet (stage 2 of a capture, see
+    /// `clipboard::capture_rest`). Existing formats keep their payload; id, pin and timestamp stay.
+    pub fn with_extra(&self, extra: Vec<(FormatKey, Payload)>) -> Item {
+        let mut formats = self.formats.clone();
+        formats.extend(extra.into_iter().filter(|(k, _)| self.payload(k).is_none()));
+        Item::new(self.id, self.unix_ms, self.pinned, formats)
+    }
+
     pub fn payload(&self, key: &FormatKey) -> Option<&Payload> {
         self.formats.iter().find(|(k, _)| k == key).map(|(_, p)| p)
     }
@@ -260,5 +268,30 @@ impl Item {
             Payload::OnDisk { sha1, .. } => Some(sha1),
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utf16(s: &str) -> Payload {
+        Payload::inline(s.encode_utf16().flat_map(u16::to_le_bytes).collect())
+    }
+
+    #[test]
+    fn with_extra_appends_only_new_formats_and_keeps_identity() {
+        let text = (FormatKey::Standard(CF_UNICODETEXT), utf16("hello"));
+        let mut base = Item::new(7, 1234, true, vec![text]);
+        base.id = 7;
+        let html = (FormatKey::reg(FMT_HTML), Payload::inline(b"<b>hello</b>".to_vec()));
+        let dup_text = (FormatKey::Standard(CF_UNICODETEXT), utf16("different"));
+        let full = base.with_extra(vec![dup_text, html]);
+        assert_eq!((full.id, full.unix_ms, full.pinned), (7, 1234, true));
+        assert_eq!(full.formats.len(), 2);
+        assert_eq!(full.primary, base.primary);
+        assert_eq!(full.kind, base.kind);
+        assert_eq!(full.preview, "hello", "the text already there is not replaced");
+        assert!(full.payload_named(FMT_HTML).is_some());
     }
 }

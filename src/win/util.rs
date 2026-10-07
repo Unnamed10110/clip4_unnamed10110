@@ -4,6 +4,35 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+/// Waits `ms` while still dispatching this thread's messages. Every wait on a thread that may own
+/// the clipboard goes through here: another app's `EmptyClipboard` sends WM_DESTROYCLIPBOARD to
+/// the owner and blocks until it is handled. A `WM_QUIT` seen here is re-posted for the thread's
+/// own loop.
+pub fn sleep_pump(ms: u64) {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= end {
+            break;
+        }
+        let left = (end - now).as_millis().min(u32::MAX as u128) as u32;
+        // SAFETY: wait for input or timeout, then drain this thread's queue.
+        unsafe {
+            MsgWaitForMultipleObjectsEx(None, left, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            let mut m = MSG::default();
+            while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+                if m.message == WM_QUIT {
+                    PostQuitMessage(m.wParam.0 as i32);
+                    return;
+                }
+                let _ = TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+        }
+    }
+}
+
 /// NUL-terminated UTF-16.
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

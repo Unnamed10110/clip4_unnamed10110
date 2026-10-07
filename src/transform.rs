@@ -365,11 +365,87 @@ pub fn merge_html(parts: &[Vec<u8>]) -> Vec<u8> {
     make_html_format(&fragments.join("<br>"))
 }
 
+/// Ends the fragment of an `"HTML Format"` payload with `<br>` and moves the header's end offsets
+/// along (they are fixed-width digits, so the header keeps its size). None when the payload has no
+/// usable header.
+pub fn html_append_br(doc: &[u8]) -> Option<Vec<u8>> {
+    const BR: &[u8] = b"<br>";
+    if !doc.starts_with(b"Version:") {
+        return None;
+    }
+    // (position, digit count, value) of the number after `key`.
+    let field = |key: &[u8]| -> Option<(usize, usize, usize)> {
+        let at = doc.windows(key.len()).position(|w| w.eq_ignore_ascii_case(key))? + key.len();
+        let n = doc[at..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let v = std::str::from_utf8(&doc[at..at + n]).ok()?.parse().ok()?;
+        (n > 0).then_some((at, n, v))
+    };
+    let (ef_at, ef_n, ef) = field(b"EndFragment:")?;
+    if ef > doc.len() || ef_at >= ef {
+        return None;
+    }
+    let mut out = [&doc[..ef], BR, &doc[ef..]].concat();
+    let mut bump = |at: usize, n: usize, v: usize| -> Option<()> {
+        let s = format!("{:0n$}", v + BR.len());
+        (s.len() == n).then(|| out[at..at + n].copy_from_slice(s.as_bytes()))
+    };
+    bump(ef_at, ef_n, ef)?;
+    if let Some((at, n, v)) = field(b"EndHTML:") {
+        if v >= ef {
+            bump(at, n, v)?;
+        }
+    }
+    Some(out)
+}
+
+/// Ends the last paragraph of an RTF document: `\par ` before its closing brace (nothing added when
+/// it already ends with one).
+pub fn rtf_append_par(doc: &[u8]) -> Option<Vec<u8>> {
+    if !doc.trim_ascii_start().starts_with(b"{\\rtf") {
+        return None;
+    }
+    let end = doc.iter().rposition(|&c| c == b'}')?;
+    if doc[..end].trim_ascii_end().ends_with(b"\\par") {
+        return Some(doc.to_vec());
+    }
+    Some([&doc[..end], b"\\par ", &doc[end..]].concat())
+}
+
 // ------------------------------------------------------------------ tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_gets_a_line_break_inside_its_fragment() {
+        let doc = make_html_format("<b>x</b>");
+        let r = html_append_br(&doc).unwrap();
+        assert_eq!(html_fragment(&r).unwrap(), "<b>x</b><br>");
+        assert_eq!(r.len(), doc.len() + 4);
+        let text = String::from_utf8(r.clone()).unwrap();
+        assert!(text.contains(&format!("EndHTML:{:010}", r.len())), "EndHTML moved with the insertion: {text}");
+        assert!(text.ends_with("<!--EndFragment-->\r\n</body>\r\n</html>"));
+        // Twice works too, and the header stays consistent.
+        let r2 = html_append_br(&r).unwrap();
+        assert_eq!(html_fragment(&r2).unwrap(), "<b>x</b><br><br>");
+    }
+
+    #[test]
+    fn html_without_a_usable_header_is_left_alone() {
+        assert!(html_append_br(b"<b>x</b>").is_none());
+        assert!(html_append_br(b"Version:0.9\r\nStartHTML:0000000000\r\n").is_none());
+        let hostile = b"Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000040\r\nStartFragment:0000000000\r\nEndFragment:0000009999\r\nxx";
+        assert!(html_append_br(hostile).is_none(), "offset past the end");
+    }
+
+    #[test]
+    fn rtf_gets_a_paragraph_end() {
+        assert_eq!(rtf_append_par(b"{\\rtf1 hello}").unwrap(), b"{\\rtf1 hello\\par }");
+        assert_eq!(rtf_append_par(b"{\\rtf1 hello\\par }").unwrap(), b"{\\rtf1 hello\\par }", "already ends a paragraph");
+        assert!(balanced(&rtf_append_par(b"{\\rtf1{\\b x}}").unwrap()));
+        assert!(rtf_append_par(b"plain").is_none());
+    }
 
     struct Lcg(u64);
     impl Lcg {

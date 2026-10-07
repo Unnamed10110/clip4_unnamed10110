@@ -1,5 +1,5 @@
-//! Build script: generates the tray/exe icon and the capture "click" WAV procedurally,
-//! then embeds icon + manifest (PerMonitorV2, asInvoker, Common Controls v6) as resources.
+//! Build script: generates the tray/exe icon procedurally, then embeds icon + manifest
+//! (PerMonitorV2, asInvoker, Common Controls v6) as resources.
 
 use std::fs;
 use std::path::PathBuf;
@@ -9,7 +9,6 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/clip4.manifest");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into()));
 
-    fs::write(out.join("click.wav"), make_click_wav()).expect("write wav");
     fs::write(out.join("clip4.ico"), make_ico()).expect("write ico");
     fs::copy("assets/clip4.manifest", out.join("clip4.manifest")).expect("copy manifest");
     // Relative file names resolve against the .rc's own directory.
@@ -18,40 +17,6 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let _ = embed_resource::compile_for(out.join("clip4.rc"), ["clip4"], embed_resource::NONE);
     }
-}
-
-// ---------------------------------------------------------------- click.wav
-
-/// ~28 ms, 22.05 kHz, 16-bit mono: a short decaying tick (noise burst + 1.8 kHz tone).
-fn make_click_wav() -> Vec<u8> {
-    let rate = 22_050u32;
-    let n = (rate as f32 * 0.028) as usize;
-    let mut seed = 0x1234_5678u32;
-    let mut pcm = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let noise = ((seed >> 16) as f32 / 32768.0) - 1.0;
-        let t = i as f32 / rate as f32;
-        let env = (-t * 220.0).exp();
-        let tone = (t * 1800.0 * std::f32::consts::TAU).sin();
-        let s = (0.55 * noise + 0.45 * tone) * env * 0.45;
-        pcm.extend_from_slice(&((s * 32767.0) as i16).to_le_bytes());
-    }
-    let mut w = Vec::new();
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    w.extend_from_slice(&1u16.to_le_bytes()); // mono
-    w.extend_from_slice(&rate.to_le_bytes());
-    w.extend_from_slice(&(rate * 2).to_le_bytes());
-    w.extend_from_slice(&2u16.to_le_bytes());
-    w.extend_from_slice(&16u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    w.extend_from_slice(&pcm);
-    w
 }
 
 // ---------------------------------------------------------------- clip4.ico

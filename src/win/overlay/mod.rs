@@ -403,7 +403,7 @@ impl Overlay {
                 let cue = wide(if id == PaneId::Main { "Search" } else { "Search pinned" });
                 SendMessageW(edit, 0x1501, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); // EM_SETCUEBANNER
                 input::subclass_edit(edit, id);
-                self.round_corners(hwnd);
+                self.dwm_style(hwnd);
                 let mut st = self.st.borrow_mut();
                 st.panes[id as usize].hwnd = hwnd;
                 st.panes[id as usize].edit = edit;
@@ -414,7 +414,12 @@ impl Overlay {
         self.prewarm(app);
     }
 
-    fn round_corners(&self, hwnd: HWND) {
+    fn dwm_style(&self, hwnd: HWND) {
+        // No fade/scale animation on show and hide: DWM runs it for ~150-250 ms, during which the
+        // overlay is invisible or half-faded, which reads as "slow to open" (and to close).
+        let off: i32 = 1;
+        // SAFETY: attribute value is a valid i32.
+        let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as *const _, 4) };
         // Windows 11: DWMWCP_ROUND. Windows 10 rejects the attribute; a rounded region is the fallback.
         let pref: i32 = 2;
         // SAFETY: attribute value is a valid i32.
@@ -592,7 +597,9 @@ impl Overlay {
         if fg != m && fg != p && !fg.0.is_null() {
             self.st.borrow_mut().prev_fg = fg;
         }
-        crate::log_dbg!("overlay show: previous window {:?} ({})", self.st.borrow().prev_fg.0, super::clipboard::process_name_of_window(self.st.borrow().prev_fg));
+        if crate::win::log::enabled(crate::win::log::Level::Debug) {
+            crate::log_dbg!("overlay show: previous window {:?} ({})", self.st.borrow().prev_fg.0, super::clipboard::process_name_of_window(self.st.borrow().prev_fg));
+        }
         // Where to open: the remembered position (while the monitor layout is unchanged) wins; it
         // lives on ITS OWN monitor, whichever window the user happens to be working in. Otherwise
         // centre on the monitor of that window.
@@ -643,20 +650,30 @@ impl Overlay {
             st.visible = true;
             st.shown_at = Some(Instant::now());
         }
-        // SAFETY: show windows; the pinned pane is shown WITHOUT activation so focus stays on the list.
+        // SAFETY: show windows WITHOUT activation (the main pane gets the foreground below).
         unsafe {
             let _ = ShowWindow(p, SW_SHOWNOACTIVATE);
-            let _ = ShowWindow(m, SW_SHOW);
+            let _ = ShowWindow(m, SW_SHOWNOACTIVATE);
             let _ = SetTimer(Some(m), T_ACQUIRE, 50, None);
             let _ = SetTimer(Some(m), T_AGES, 1000, None);
             let _ = SetTimer(Some(m), T_FOCUSPOLL, 250, None);
         }
+        // Paint now, activate after. Activating makes the previously active app handle
+        // WM_NCACTIVATE and a busy one answers late; WM_PAINT is the lowest-priority message, so
+        // left in the queue the first frame would only appear once that wait was over.
+        self.invalidate_all();
+        // SAFETY: both are our own windows, on this thread.
+        unsafe {
+            let _ = UpdateWindow(p);
+            let _ = UpdateWindow(m);
+        }
+        let t = Instant::now();
         input::take_foreground(m);
+        crate::log_dbg!("overlay show: foreground taken in {} ms", t.elapsed().as_millis());
         // SAFETY: plain query. Usually we already own the foreground here; no need to wait for a tick.
         if unsafe { GetForegroundWindow() } == m {
             self.st.borrow_mut().acquired = true;
         }
-        self.invalidate_all();
         let _ = was_visible;
     }
 

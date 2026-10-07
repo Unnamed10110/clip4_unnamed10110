@@ -12,8 +12,10 @@ use crate::codec;
 use crate::model::*;
 use std::fs;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use windows::Win32::Foundation::HWND;
 
 pub enum CaptureTask {
     /// Capture the clipboard now. `seq` is the sequence number of the update that triggered it.
@@ -36,6 +38,8 @@ pub struct Workers {
     /// Start time (unix ms) of the capture in progress, 0 when idle — for the 30 s watchdog.
     cap_since: Arc<AtomicI64>,
     io: Sender<IoTask>,
+    /// Stage 2 requests (see `spawn_completer`).
+    rest: Sender<RestReq>,
     blobs: BlobStore,
 }
 
@@ -84,7 +88,8 @@ impl Workers {
                 }
             });
         });
-        Workers { cap: Arc::new(Mutex::new(cap_tx)), cap_since, io: io_tx, blobs }
+        let rest = spawn_completer(blobs.clone());
+        Workers { cap: Arc::new(Mutex::new(cap_tx)), cap_since, io: io_tx, rest, blobs }
     }
 
     pub fn capture(&self, seq: u32) {
@@ -104,6 +109,12 @@ impl Workers {
     pub fn io(&self, t: IoTask) {
         let _ = self.io.send(t);
     }
+
+    /// Asks for the formats stage 1 left out of item `id` (captured at `seq`) once the clipboard
+    /// has been quiet for `COMPLETE_QUIET`.
+    pub fn complete(&self, seq: u32, id: u64) {
+        let _ = self.rest.send(RestReq { seq, id });
+    }
 }
 
 // ---------------- capture ----------------
@@ -121,15 +132,21 @@ pub fn set_capture_owner(h: SendHwnd) {
 /// open it first, that flush fails while we wait on the source's delayed rendering.
 const CAPTURE_SETTLE: std::time::Duration = std::time::Duration::from_millis(25);
 
-fn do_capture(blobs: &BlobStore, trigger_seq: u32) {
-    std::thread::sleep(CAPTURE_SETTLE);
-    let owner = match CAPTURE_OWNER.load(std::sync::atomic::Ordering::Relaxed) {
+fn capture_owner() -> Option<HWND> {
+    match CAPTURE_OWNER.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
         h => Some(SendHwnd(h).get()),
-    };
-    match clipboard::capture(owner) {
+    }
+}
+
+fn do_capture(blobs: &BlobStore, trigger_seq: u32) {
+    std::thread::sleep(CAPTURE_SETTLE);
+    match clipboard::capture(capture_owner()) {
         Captured::Busy => {
-            post_ui(UiMsg::CaptureBusy { seq: trigger_seq });
+            post_ui(UiMsg::CaptureBusy { seq: trigger_seq, unreadable: false });
+        }
+        Captured::Unreadable => {
+            post_ui(UiMsg::CaptureBusy { seq: trigger_seq, unreadable: true });
         }
         Captured::Excluded(seq) => {
             // Privacy opt-out: nothing recorded, no sound, nothing logged about content.
@@ -141,21 +158,72 @@ fn do_capture(blobs: &BlobStore, trigger_seq: u32) {
         }
         Captured::Ok(snap) => {
             // The bytes are safely copied: from here the sequence counts as consumed (lesson 18.4).
-            let seq = snap.seq;
-            let lock_ms = snap.lock_ms;
+            let (seq, lock_ms, more) = (snap.seq, snap.lock_ms, snap.more);
             if clipboard::is_own(seq) {
                 post_ui(UiMsg::CaptureConsumed { seq });
                 return;
             }
             match build_item(blobs, snap) {
                 Some(item) => {
-                    post_ui(UiMsg::Captured { seq, item, lock_ms });
+                    post_ui(UiMsg::Captured { seq, item, lock_ms, more });
                 }
                 None => {
                     post_ui(UiMsg::CaptureConsumed { seq });
                 }
             }
         }
+    }
+}
+
+// ---------------- stage 2 ----------------
+
+/// Stage 1 reads only the essential formats so the source app (Excel above all, which renders each
+/// format on request on its UI thread) is not hammered right after Ctrl+C. The rest is read here,
+/// once no newer copy has asked for 600 ms.
+const COMPLETE_QUIET: Duration = Duration::from_millis(600);
+
+struct RestReq {
+    seq: u32,
+    id: u64,
+}
+
+/// The newest request, once `quiet` has passed without a newer one; `None` when the channel closes.
+/// A burst of copies therefore completes only its last copy.
+fn coalesce<T>(rx: &Receiver<T>, quiet: Duration) -> Option<T> {
+    let mut latest = rx.recv().ok()?;
+    while let Ok(next) = rx.recv_timeout(quiet) {
+        latest = next;
+    }
+    Some(latest)
+}
+
+/// Its own thread, so a slow source never holds up the capture of the next copy. A read that
+/// never returns only stalls stage 2 (the items keep what stage 1 gave them).
+fn spawn_completer(blobs: BlobStore) -> Sender<RestReq> {
+    let (tx, rx) = channel::<RestReq>();
+    let _ = std::thread::Builder::new().name("complete".into()).spawn(move || {
+        guarded("complete", || {
+            while let Some(r) = coalesce(&rx, COMPLETE_QUIET) {
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| do_complete(&blobs, r)));
+                if done.is_err() {
+                    crate::log_err!("capture completion panicked; dropped");
+                }
+            }
+        });
+    });
+    tx
+}
+
+fn do_complete(blobs: &BlobStore, r: RestReq) {
+    match clipboard::capture_rest(capture_owner(), r.seq) {
+        Captured::Ok(snap) => {
+            let n = snap.formats.len();
+            if let Some(item) = build_item(blobs, snap) {
+                crate::log_dbg!("completed seq {}: {n} more formats", r.seq);
+                post_ui(UiMsg::Completed { id: r.id, formats: item.formats });
+            }
+        }
+        _ => crate::log_dbg!("completion of seq {} dropped (superseded, private or unreadable)", r.seq),
     }
 }
 
@@ -357,4 +425,32 @@ fn import_clip2(blobs: &BlobStore) -> Vec<Item> {
         dehydrate(blobs, it);
     }
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_yields_the_newest_request_after_the_quiet_period() {
+        let (tx, rx) = channel();
+        for n in 1..=3 {
+            tx.send(n).unwrap();
+        }
+        assert_eq!(coalesce(&rx, Duration::from_millis(30)), Some(3));
+        drop(tx);
+        assert_eq!(coalesce(&rx, Duration::from_millis(30)), None, "a closed, empty channel ends the thread");
+    }
+
+    #[test]
+    fn coalesce_waits_for_a_newer_request_arriving_within_the_quiet_period() {
+        let (tx, rx) = channel();
+        tx.send(1).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx.send(2).unwrap();
+        });
+        assert_eq!(coalesce(&rx, Duration::from_millis(200)), Some(2));
+        t.join().unwrap();
+    }
 }

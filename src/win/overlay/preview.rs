@@ -105,7 +105,7 @@ impl Overlay {
             )
             .unwrap_or_default()
         };
-        self.round_corners(hwnd);
+        self.dwm_style(hwnd);
         self.st.borrow_mut().preview.hwnd = hwnd;
     }
 

@@ -1,6 +1,6 @@
 //! Cross-thread messages delivered to the UI thread's hidden main window.
 use super::settings::Action;
-use crate::model::Item;
+use crate::model::{FormatKey, Item, Payload};
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 /// Boxed [`UiMsg`] in LPARAM (see `util::post_box`).
@@ -17,10 +17,14 @@ pub const WM_PASTE_WAKE: u32 = WM_APP + 5;
 pub const WM_HOOK_REARM: u32 = WM_APP + 6;
 
 pub enum UiMsg {
-    /// A built item from the capture worker (id not yet assigned).
-    Captured { seq: u32, item: Item, lock_ms: u32 },
+    /// A built item from the capture worker (id not yet assigned). `more`: stage 2 will follow.
+    Captured { seq: u32, item: Item, lock_ms: u32, more: bool },
+    /// Stage 2 of a capture: formats to add to item `id` (the ones it does not have yet).
+    Completed { id: u64, formats: Vec<(FormatKey, Payload)> },
     /// The clipboard could not be opened; retry later.
-    CaptureBusy { seq: u32 },
+    /// `unreadable`: the clipboard opened but the source handed nothing over (short retries);
+    /// otherwise the clipboard could not be opened (long retries).
+    CaptureBusy { seq: u32, unreadable: bool },
     /// The snapshot was safely copied (or deliberately discarded); the sequence is consumed.
     CaptureConsumed { seq: u32 },
     Loaded { items: Vec<Item>, note: Option<String> },
