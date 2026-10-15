@@ -34,6 +34,7 @@ const TIMER_SAVE: usize = 1;
 const TIMER_CAPTURE_RETRY: usize = 2;
 const TIMER_LISTENER_RETRY: usize = 3;
 const TIMER_HOTKEY_HEALTH: usize = 4;
+const TIMER_GUARD: usize = 5;
 
 const IDM_SHOW: u32 = 100;
 const IDM_COPY_FOCUSED: u32 = 101;
@@ -76,6 +77,7 @@ pub struct App {
     taskbar_created: Cell<u32>,
     exiting: Cell<bool>,
     listener_ok: Cell<bool>,
+    guard_armed: Cell<bool>,
 }
 
 thread_local! {
@@ -199,6 +201,7 @@ impl App {
             taskbar_created: Cell::new(0),
             exiting: Cell::new(false),
             listener_ok: Cell::new(false),
+            guard_armed: Cell::new(false),
         })
     }
 
@@ -547,6 +550,7 @@ impl App {
                     crate::log_err!("history save failed");
                 }
             }
+            UiMsg::ReaderStarted => self.arm_guard(),
             UiMsg::Thumb { id, w, h, bgra } => self.overlay.on_thumb(self, id, w, h, &bgra),
             UiMsg::PasteResult { ok, note } => {
                 if !ok {
@@ -668,6 +672,17 @@ impl App {
         }
     }
 
+    /// While a reader thread is inside a clipboard read, check once a second that it is not stuck
+    /// (`Workers::unstick`). Armed by the reader itself, so there is no idle wakeup.
+    fn arm_guard(&self) {
+        if !self.guard_armed.replace(true) {
+            // SAFETY: timer on our window.
+            unsafe {
+                SetTimer(Some(self.hwnd.get()), TIMER_GUARD, 1000, None);
+            }
+        }
+    }
+
     pub fn request_exit(&self) {
         self.exiting.set(true);
         // SAFETY: ends the message loop; `shutdown` flushes history.
@@ -713,6 +728,14 @@ impl App {
                     } else {
                         crate::log_err!("AddClipboardFormatListener failed twice; history will not record");
                         self.notice("clip4", "Clipboard monitoring could not be started, so copies will not be recorded. Try restarting clip4.");
+                    }
+                }
+                TIMER_GUARD => {
+                    let _ = KillTimer(Some(hwnd), TIMER_GUARD);
+                    self.guard_armed.set(false);
+                    self.workers.unstick(worker::STALL_MS);
+                    if self.workers.busy() {
+                        self.arm_guard();
                     }
                 }
                 TIMER_HOTKEY_HEALTH => {

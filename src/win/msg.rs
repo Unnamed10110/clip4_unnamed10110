@@ -27,6 +27,8 @@ pub enum UiMsg {
     CaptureBusy { seq: u32, unreadable: bool },
     /// The snapshot was safely copied (or deliberately discarded); the sequence is consumed.
     CaptureConsumed { seq: u32 },
+    /// A reader thread began a clipboard read: arms the stall guard (`App::arm_guard`).
+    ReaderStarted,
     Loaded { items: Vec<Item>, note: Option<String> },
     Saved { ok: bool },
     Thumb { id: u64, w: u32, h: u32, bgra: Vec<u8> },

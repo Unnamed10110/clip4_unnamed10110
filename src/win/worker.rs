@@ -11,11 +11,13 @@ use super::{dpapi, wic};
 use crate::codec;
 use crate::model::*;
 use std::fs;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::System::Threading::TerminateThread;
 
 pub enum CaptureTask {
     /// Capture the clipboard now. `seq` is the sequence number of the update that triggered it.
@@ -32,33 +34,64 @@ pub enum IoTask {
     ClearBlobs,
 }
 
+/// A thread that reads the clipboard (capture, stage 2) and what the guard needs to cut a stuck
+/// read short.
+struct Reader {
+    name: &'static str,
+    /// Start (unix ms) of the task in progress, 0 when idle.
+    since: Arc<AtomicI64>,
+    /// Sequence of the task in progress (diagnostics).
+    seq: Arc<AtomicU32>,
+    thread: Option<JoinHandle<()>>,
+}
+
 #[derive(Clone)]
 pub struct Workers {
     cap: Arc<Mutex<Sender<CaptureTask>>>,
-    /// Start time (unix ms) of the capture in progress, 0 when idle — for the 30 s watchdog.
-    cap_since: Arc<AtomicI64>,
     io: Sender<IoTask>,
     /// Stage 2 requests (see `spawn_completer`).
-    rest: Sender<RestReq>,
+    rest: Arc<Mutex<Sender<RestReq>>>,
+    /// `[capture, stage 2]`
+    readers: Arc<Mutex<[Reader; 2]>>,
     blobs: BlobStore,
 }
 
-/// A capture that has been running this long is stuck (a source whose delayed rendering never
-/// returns). It cannot be cancelled, so the capture thread is replaced (spec 19.4).
-const CAPTURE_WATCHDOG_MS: i64 = 30_000;
+/// A read that has been running this long is stuck on a source whose delayed rendering does not
+/// answer. While it runs, the clipboard is held for every app (nobody can copy or paste), and it
+/// cannot be cancelled: the only way to make Windows release the clipboard is to end the thread.
+/// A legitimate render of a huge Excel range can take longer; holding everyone's clipboard that long
+/// is worse than skipping that one copy.
+pub const STALL_MS: i64 = 5_000;
+/// Same, when a paste is already waiting for the clipboard.
+pub const PASTE_WAITING_MS: i64 = 750;
 
-fn spawn_capture_thread(blobs: BlobStore, since: Arc<AtomicI64>) -> Option<Sender<CaptureTask>> {
+fn stalled(since: i64, now: i64, limit: i64) -> bool {
+    since != 0 && now - since >= limit
+}
+
+/// Ends a reader thread.
+fn kill(thread: &JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: the handle belongs to the live `JoinHandle`. The thread sits in a clipboard call and
+    // holds none of our locks; the cost is its leaked stack and COM state.
+    unsafe {
+        let _ = TerminateThread(HANDLE(thread.as_raw_handle()), 1);
+    }
+}
+
+fn spawn_capture_thread(blobs: BlobStore, since: Arc<AtomicI64>, seq: Arc<AtomicU32>) -> Option<(Sender<CaptureTask>, JoinHandle<()>)> {
     let (tx, rx) = channel::<CaptureTask>();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
             guarded("capture", || {
                 while let Ok(t) = rx.recv() {
+                    let CaptureTask::Capture { seq: s } = t;
+                    seq.store(s, Ordering::SeqCst);
                     since.store(now_unix_ms(), Ordering::SeqCst);
+                    post_ui(UiMsg::ReaderStarted);
                     // A panic drops this task only; the loop (and the thread) keeps serving.
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match t {
-                        CaptureTask::Capture { seq } => do_capture(&blobs, seq),
-                    }));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| do_capture(&blobs, s)));
                     since.store(0, Ordering::SeqCst);
                     if r.is_err() {
                         crate::log_err!("capture task panicked; dropped");
@@ -67,14 +100,25 @@ fn spawn_capture_thread(blobs: BlobStore, since: Arc<AtomicI64>) -> Option<Sende
             });
         })
         .ok()?;
-    Some(tx)
+    Some((tx, handle))
+}
+
+static WORKERS: OnceLock<Workers> = OnceLock::new();
+
+/// For the paste thread: a paste is waiting on a clipboard that one of our readers holds.
+pub fn unstick(min_ms: i64) -> bool {
+    WORKERS.get().is_some_and(|w| w.unstick(min_ms))
 }
 
 impl Workers {
     pub fn start(blobs: BlobStore) -> Workers {
-        let cap_since = Arc::new(AtomicI64::new(0));
+        let new_clocks = || (Arc::new(AtomicI64::new(0)), Arc::new(AtomicU32::new(0)));
+        let ((cap_since, cap_seq), (rest_since, rest_seq)) = (new_clocks(), new_clocks());
         let (dead_tx, _) = channel::<CaptureTask>();
-        let cap_tx = spawn_capture_thread(blobs.clone(), cap_since.clone()).unwrap_or(dead_tx);
+        let (cap_tx, cap_thread) = match spawn_capture_thread(blobs.clone(), cap_since.clone(), cap_seq.clone()) {
+            Some((tx, h)) => (tx, Some(h)),
+            None => (dead_tx, None),
+        };
         let (io_tx, io_rx) = channel::<IoTask>();
         let b2 = blobs.clone();
         let _ = std::thread::Builder::new().name("io".into()).spawn(move || {
@@ -88,19 +132,18 @@ impl Workers {
                 }
             });
         });
-        let rest = spawn_completer(blobs.clone());
-        Workers { cap: Arc::new(Mutex::new(cap_tx)), cap_since, io: io_tx, rest, blobs }
+        let (rest_tx, rest_thread) = spawn_completer(blobs.clone(), rest_since.clone(), rest_seq.clone());
+        let readers = [
+            Reader { name: "capture", since: cap_since, seq: cap_seq, thread: cap_thread },
+            Reader { name: "stage 2 read", since: rest_since, seq: rest_seq, thread: rest_thread },
+        ];
+        let w = Workers { cap: Arc::new(Mutex::new(cap_tx)), io: io_tx, rest: Arc::new(Mutex::new(rest_tx)), readers: Arc::new(Mutex::new(readers)), blobs };
+        let _ = WORKERS.set(w.clone());
+        w
     }
 
     pub fn capture(&self, seq: u32) {
-        let since = self.cap_since.load(Ordering::SeqCst);
-        if since != 0 && now_unix_ms() - since > CAPTURE_WATCHDOG_MS {
-            crate::log_err!("capture watchdog: a capture has been stuck for {} s; replacing the capture thread", (now_unix_ms() - since) / 1000);
-            self.cap_since.store(0, Ordering::SeqCst);
-            if let (Some(tx), Ok(mut g)) = (spawn_capture_thread(self.blobs.clone(), self.cap_since.clone()), self.cap.lock()) {
-                *g = tx; // the stuck thread's receiver is dropped; it exits if it ever unblocks
-            }
-        }
+        self.unstick(STALL_MS);
         if let Ok(g) = self.cap.lock() {
             let _ = g.send(CaptureTask::Capture { seq });
         }
@@ -113,7 +156,62 @@ impl Workers {
     /// Asks for the formats stage 1 left out of item `id` (captured at `seq`) once the clipboard
     /// has been quiet for `COMPLETE_QUIET`.
     pub fn complete(&self, seq: u32, id: u64) {
-        let _ = self.rest.send(RestReq { seq, id });
+        if let Ok(g) = self.rest.lock() {
+            let _ = g.send(RestReq { seq, id });
+        }
+    }
+
+    /// A clipboard read is in progress.
+    pub fn busy(&self) -> bool {
+        self.readers.lock().is_ok_and(|r| r.iter().any(|x| x.since.load(Ordering::SeqCst) != 0))
+    }
+
+    /// Cuts short every reader whose current task has run for `min_ms` or more: its thread is ended
+    /// and replaced, and the copy it was reading is skipped. True when something was cut.
+    pub fn unstick(&self, min_ms: i64) -> bool {
+        let Ok(mut readers) = self.readers.lock() else { return false };
+        let now = now_unix_ms();
+        let mut cut = Vec::new();
+        for (i, r) in readers.iter_mut().enumerate() {
+            let since = r.since.load(Ordering::SeqCst);
+            if !stalled(since, now, min_ms) {
+                continue;
+            }
+            let (seq, owner) = (r.seq.load(Ordering::SeqCst), clipboard::content_owner_name());
+            crate::log_warn!("{} of sequence {seq} stalled for {} ms (content owner {owner}); cutting it short", r.name, now - since);
+            if let Some(t) = r.thread.take() {
+                kill(&t);
+            }
+            r.since.store(0, Ordering::SeqCst);
+            // The replacement; the dead thread's queue (at most stale requests) goes with it.
+            if i == 0 {
+                if let Some((tx, h)) = spawn_capture_thread(self.blobs.clone(), r.since.clone(), r.seq.clone()) {
+                    r.thread = Some(h);
+                    if let Ok(mut g) = self.cap.lock() {
+                        *g = tx;
+                    }
+                }
+            } else {
+                let (tx, h) = spawn_completer(self.blobs.clone(), r.since.clone(), r.seq.clone());
+                r.thread = h;
+                if let Ok(mut g) = self.rest.lock() {
+                    *g = tx;
+                }
+            }
+            cut.push(owner);
+        }
+        drop(readers);
+        let Some(owner) = cut.pop() else { return false };
+        post_ui(UiMsg::Notice(format!("A copy from {owner} was skipped: it did not hand over its data in time.")));
+        // Whether Windows really released the clipboard is the open question of this mechanism.
+        let _ = std::thread::Builder::new().name("unstick-check".into()).spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            match clipboard::holder_name() {
+                Some(h) => crate::log_warn!("after cutting a read short the clipboard is still held by {h}"),
+                None => crate::log_info!("the clipboard was released after cutting a read short"),
+            }
+        });
+        true
     }
 }
 
@@ -199,19 +297,26 @@ fn coalesce<T>(rx: &Receiver<T>, quiet: Duration) -> Option<T> {
 
 /// Its own thread, so a slow source never holds up the capture of the next copy. A read that
 /// never returns only stalls stage 2 (the items keep what stage 1 gave them).
-fn spawn_completer(blobs: BlobStore) -> Sender<RestReq> {
+fn spawn_completer(blobs: BlobStore, since: Arc<AtomicI64>, seq: Arc<AtomicU32>) -> (Sender<RestReq>, Option<JoinHandle<()>>) {
     let (tx, rx) = channel::<RestReq>();
-    let _ = std::thread::Builder::new().name("complete".into()).spawn(move || {
-        guarded("complete", || {
-            while let Some(r) = coalesce(&rx, COMPLETE_QUIET) {
-                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| do_complete(&blobs, r)));
-                if done.is_err() {
-                    crate::log_err!("capture completion panicked; dropped");
+    let handle = std::thread::Builder::new()
+        .name("complete".into())
+        .spawn(move || {
+            guarded("complete", || {
+                while let Some(r) = coalesce(&rx, COMPLETE_QUIET) {
+                    seq.store(r.seq, Ordering::SeqCst);
+                    since.store(now_unix_ms(), Ordering::SeqCst);
+                    post_ui(UiMsg::ReaderStarted);
+                    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| do_complete(&blobs, r)));
+                    since.store(0, Ordering::SeqCst);
+                    if done.is_err() {
+                        crate::log_err!("capture completion panicked; dropped");
+                    }
                 }
-            }
-        });
-    });
-    tx
+            });
+        })
+        .ok();
+    (tx, handle)
 }
 
 fn do_complete(blobs: &BlobStore, r: RestReq) {
@@ -452,5 +557,28 @@ mod tests {
         });
         assert_eq!(coalesce(&rx, Duration::from_millis(200)), Some(2));
         t.join().unwrap();
+    }
+
+    #[test]
+    fn a_task_counts_as_stalled_only_after_the_limit() {
+        assert!(!stalled(0, 10_000, 5_000), "idle readers have since == 0");
+        assert!(!stalled(1_000, 5_999, 5_000));
+        assert!(stalled(1_000, 6_000, 5_000));
+    }
+
+    #[test]
+    fn a_blocked_thread_can_be_ended() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        let (tx, rx) = channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _ = rx.recv(); // blocked for good, like a read stuck in a source app
+        });
+        kill(&t);
+        // SAFETY: the handle is the live thread's.
+        let r = unsafe { WaitForSingleObject(HANDLE(t.as_raw_handle()), 2000) };
+        assert_eq!(r, WAIT_OBJECT_0, "the thread ended");
+        drop(tx);
     }
 }

@@ -221,15 +221,27 @@ impl Ctx {
         );
         check_target(target)?;
         let backup = if restore { clipboard::backup(self.hwnd) } else { None };
+        let mut typed = false;
         let r = (|| {
-            self.set_clipboard(&formats)?;
+            if let Err(e) = self.set_clipboard(&formats) {
+                if !is_busy(&e) {
+                    return Err(e);
+                }
+                // Somebody else holds the clipboard: type the text instead, the clipboard stays untouched.
+                typed = true;
+                self.focus(target)?;
+                sleep_pump(AFTER_FOCUS_MS);
+                release_modifiers();
+                sleep_pump(AFTER_MODS_MS);
+                return self.type_formats(&formats, e);
+            }
             self.focus(target)?;
             sleep_pump(AFTER_FOCUS_MS);
             release_modifiers();
             sleep_pump(AFTER_MODS_MS);
             send_ctrl_v()
         })();
-        if restore {
+        if restore && !typed {
             sleep_pump(SETTLE_AFTER_PASTE_MS);
             self.restore_backup(backup);
         }
@@ -239,6 +251,7 @@ impl Ctx {
     fn sequence(&self, steps: Vec<Vec<(FormatKey, Payload)>>, target: HWND) -> R {
         check_target(target)?;
         let backup = clipboard::backup(self.hwnd);
+        let mut wrote = false;
         let r = (|| {
             self.focus(target)?;
             sleep_pump(AFTER_FOCUS_MS);
@@ -249,15 +262,31 @@ impl Ctx {
                 if foreground() != target {
                     return Err("the target window lost focus; paste stopped".to_string());
                 }
-                self.set_clipboard(step)?;
-                send_ctrl_v()?;
+                match self.set_clipboard(step) {
+                    Ok(()) => {
+                        wrote = true;
+                        send_ctrl_v()?;
+                    }
+                    Err(e) if is_busy(&e) => self.type_formats(step, e)?,
+                    Err(e) => return Err(e),
+                }
                 sleep_pump(SETTLE_AFTER_PASTE_MS / 2);
             }
             Ok(())
         })();
         sleep_pump(SETTLE_AFTER_PASTE_MS);
-        self.restore_backup(backup);
+        if wrote {
+            self.restore_backup(backup);
+        }
         r
+    }
+
+    /// The clipboard cannot be written (held by another app): types the formats' text as keystrokes.
+    /// Without text (an image, files) the original error stands.
+    fn type_formats(&self, formats: &[(FormatKey, Payload)], why: String) -> R {
+        let text = text_for_typing(&self.hydrate(formats)).ok_or(why)?;
+        crate::log_warn!("clipboard busy: typed {} characters instead", text.chars().count());
+        type_text(&text)
     }
 
     fn excel(&self, texts: Vec<String>, target: HWND) -> R {
@@ -554,4 +583,44 @@ fn type_text(text: &str) -> R {
         }
     }
     Ok(())
+}
+
+/// `write_prepared` gave up: another app holds the clipboard.
+fn is_busy(err: &str) -> bool {
+    err.contains("clipboard busy")
+}
+
+/// What to type when the clipboard cannot be written: the Unicode text, else the ANSI text.
+fn text_for_typing(formats: &[(FormatKey, Vec<u8>)]) -> Option<String> {
+    let find = |cf: u32| formats.iter().find(|(k, _)| k.is_std(cf)).map(|(_, b)| b.as_slice());
+    let text = match find(CF_UNICODETEXT) {
+        Some(b) => crate::preview::decode_unicode(b),
+        None => crate::preview::decode_ansi(find(CF_TEXT)?),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn std(cf: u32, b: &[u8]) -> (FormatKey, Vec<u8>) {
+        (FormatKey::Standard(cf), b.to_vec())
+    }
+
+    #[test]
+    fn typing_prefers_unicode_then_ansi_and_never_images() {
+        let uni: Vec<u8> = "héllo".encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+        let both = [std(CF_TEXT, b"ansi\0"), std(CF_UNICODETEXT, &uni)];
+        assert_eq!(text_for_typing(&both).as_deref(), Some("héllo"));
+        assert_eq!(text_for_typing(&[std(CF_TEXT, b"ansi\0")]).as_deref(), Some("ansi"));
+        assert_eq!(text_for_typing(&[std(CF_DIB, &[0u8; 64])]), None, "an image has no text to type");
+        assert_eq!(text_for_typing(&[std(CF_UNICODETEXT, &[0, 0])]), None, "empty text is nothing to type");
+    }
+
+    #[test]
+    fn only_the_busy_error_triggers_typing() {
+        assert!(is_busy("could not set the clipboard (clipboard busy)"));
+        assert!(!is_busy("the item's data is no longer available"));
+    }
 }

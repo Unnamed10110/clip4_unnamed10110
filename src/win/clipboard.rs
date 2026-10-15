@@ -9,14 +9,14 @@ use crate::model::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_ACCESS_DENIED, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, WIN32_ERROR, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_GDI, TYMED_HGLOBAL};
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::{OleGetClipboard, OleInitialize, OleUninitialize, ReleaseStgMedium};
-use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_NULL};
 
 // ---- limits (spec 6.4) ----
 pub const MAX_FORMATS: usize = 12;
@@ -57,6 +57,63 @@ pub fn open(owner: Option<HWND>, attempts: u32, delay_ms: u64) -> Option<Clipboa
     None
 }
 
+/// How long the content owner gets to answer a `WM_NULL` before we call it unresponsive.
+const PROBE_MS: u32 = 250;
+/// A paste that cannot get the clipboard for this long asks to have our own stuck readers cut short.
+const UNSTICK_AFTER_MS: u64 = 600;
+
+/// The clipboard owner cannot answer messages right now (busy or hung), so asking it to render
+/// data would block us, holding the clipboard for everyone, until it does. Nothing is locked here.
+/// An owner we cannot message (UIPI: `ERROR_ACCESS_DENIED`) or that has no window counts as fine.
+pub fn owner_unresponsive() -> bool {
+    // SAFETY: plain queries; the probe is bounded by its timeout.
+    unsafe {
+        let Ok(owner) = GetClipboardOwner() else { return false };
+        if owner.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(owner, Some(&mut pid));
+        if pid == 0 || pid == GetCurrentProcessId() {
+            return false;
+        }
+        SetLastError(WIN32_ERROR(0));
+        let r = SendMessageTimeoutW(owner, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, PROBE_MS, None);
+        r.0 == 0 && GetLastError() != ERROR_ACCESS_DENIED
+    }
+}
+
+/// The clipboard is currently open in a window of this process (one of our own threads holds it).
+fn held_by_us() -> bool {
+    // SAFETY: plain queries.
+    unsafe {
+        let Ok(w) = GetOpenClipboardWindow() else { return false };
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(w, Some(&mut pid));
+        pid == GetCurrentProcessId()
+    }
+}
+
+/// `open` for writes and paste-time reads (~1.5 s of retries). If our own capture thread is the one
+/// holding the clipboard, it is cut short after `UNSTICK_AFTER_MS` instead of making the paste fail.
+fn open_for_write(owner: HWND) -> Option<ClipboardGuard> {
+    let mut asked = false;
+    for i in 0..WRITE_TRIES {
+        // SAFETY: OpenClipboard has no memory-safety preconditions.
+        if unsafe { OpenClipboard(Some(owner)) }.is_ok() {
+            return Some(ClipboardGuard(()));
+        }
+        if i + 1 < WRITE_TRIES {
+            if !asked && u64::from(i) * WRITE_GAP_MS >= UNSTICK_AFTER_MS && held_by_us() {
+                asked = true;
+                super::worker::unstick(super::worker::PASTE_WAITING_MS);
+            }
+            sleep_pump(WRITE_GAP_MS);
+        }
+    }
+    None
+}
+
 /// The clipboard holds at least one format. No lock needed.
 pub fn has_any_format() -> bool {
     // SAFETY: plain query.
@@ -80,7 +137,7 @@ pub fn holder_name() -> Option<String> {
 }
 
 /// Process that owns the current clipboard content (diagnostics only).
-fn content_owner_name() -> String {
+pub fn content_owner_name() -> String {
     // SAFETY: plain query; works without opening the clipboard.
     match unsafe { GetClipboardOwner() } {
         Ok(h) if !h.0.is_null() => process_name_of_window(h),
@@ -484,7 +541,7 @@ fn read_plan(plan: &[Group], can_include: Option<u32>, has_text_or_files: bool, 
             let r = fetch(*id, key, cap);
             let ms = t.elapsed().as_millis();
             if ms > 20 {
-                crate::log_info!("slow format {} ({path}): {ms} ms", key.label());
+                crate::log_info!("slow format {} ({path}): {ms} ms; content owner {}", key.label(), content_owner_name());
             }
             match r {
                 Ok(Read::Bytes(b)) => {
@@ -574,6 +631,12 @@ fn capture_stage(owner: Option<HWND>, stage: Stage) -> Captured {
 
 /// One capture attempt; the bool says whether the OLE path was used.
 fn capture_impl(owner: Option<HWND>, allow_ole: bool, stage: Stage) -> (Captured, bool) {
+    // A source that cannot answer would hold the clipboard hostage while we wait for its data:
+    // leave it alone now. Stage 1 is retried by the app (50 ms rising to 500 ms), stage 2 is skipped.
+    if owner_unresponsive() {
+        crate::log_info!("clipboard owner {} is not responding; not reading it now", content_owner_name());
+        return (if matches!(stage, Stage::First) { Captured::Busy } else { Captured::Empty(sequence()) }, false);
+    }
     let Some(guard) = open(owner, 8, 5) else {
         crate::log_warn!("OpenClipboard failed after 8 attempts (capture); owner = {}", open_owner_name());
         return (Captured::Busy, false);
@@ -737,7 +800,7 @@ pub fn prepare(formats: &[(FormatKey, Vec<u8>)]) -> Option<Vec<Prepared>> {
 /// (also recorded as an own echo). On any failure before `EmptyClipboard` the user's
 /// clipboard is untouched.
 pub fn write_prepared(owner: HWND, prepared: Vec<Prepared>) -> Result<u32, &'static str> {
-    let Some(guard) = open(Some(owner), WRITE_TRIES, WRITE_GAP_MS) else {
+    let Some(guard) = open_for_write(owner) else {
         crate::log_warn!("OpenClipboard failed (write); owner = {}", open_owner_name());
         return Err("clipboard busy");
     };
@@ -780,7 +843,12 @@ pub struct Backup {
 
 /// Copies every HGLOBAL-based format of the current clipboard (CF_BITMAP as DIB).
 pub fn backup(owner: HWND) -> Option<Backup> {
-    let guard = open(Some(owner), WRITE_TRIES, WRITE_GAP_MS)?;
+    if owner_unresponsive() {
+        // Reading it would block the paste until the owner answers: paste without a restore.
+        crate::log_warn!("clipboard owner {} is not responding; no backup taken", content_owner_name());
+        return None;
+    }
+    let guard = open_for_write(owner)?;
     let mut b = Backup::default();
     let mut f = 0u32;
     let mut total = 0usize;
@@ -851,7 +919,11 @@ fn trailing_nul(b: &[u8], unit: usize) -> usize {
 
 /// Current clipboard text via a short open/copy/close (for `{{clipboard}}`).
 pub fn read_text_now(owner: HWND) -> Option<String> {
-    let guard = open(Some(owner), WRITE_TRIES, WRITE_GAP_MS)?;
+    if owner_unresponsive() {
+        crate::log_warn!("clipboard owner {} is not responding; clipboard text not read", content_owner_name());
+        return None;
+    }
+    let guard = open_for_write(owner)?;
     // SAFETY: clipboard open.
     let h = unsafe { GetClipboardData(CF_UNICODETEXT) }.ok()?;
     let r = match read_hglobal(h, MAX_FORMAT_BYTES, Some(2)) {

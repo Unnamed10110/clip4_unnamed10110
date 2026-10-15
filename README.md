@@ -168,6 +168,14 @@ Notes on deliberate choices:
 * The capture thread waits 25 ms after a change notification before opening the clipboard, so
   OLE/.NET sources can finish their own `OleFlushClipboard` (otherwise their write fails while
   we wait on their delayed rendering).
+* **clip4 never keeps the clipboard hostage** (a source app that does not answer used to hold it
+  for 30 s and more, so nothing could be copied or pasted until clip4 was restarted). Before
+  reading, clip4 pings the content owner (`WM_NULL`, 250 ms); an owner that is busy or hung is left
+  alone and retried later, without opening the clipboard. A read that still stalls is ended after 5 s
+  (750 ms when a paste is waiting for it) and replaced by a fresh capture thread; that one copy is
+  skipped, with a notice and a log line naming the app. When a paste still finds the clipboard held
+  by another app, text is typed out as keystrokes instead of failing (line breaks become Enter);
+  images and files still report the error.
 * **A copy is captured in two stages** (so the source app is not hammered right after Ctrl+C).
   Excel and other delayed-rendering sources produce each format on request on their own UI thread:
   reading all ~10 of them (RTF alone took up to 3.8 s) froze the app and delayed the new item.
