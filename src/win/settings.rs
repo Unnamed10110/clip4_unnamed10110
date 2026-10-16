@@ -1,6 +1,8 @@
 //! Persistent settings in `HKCU\Software\clip4` (spec 16.4). All reads validate and clamp.
 use super::reg::{self, Key};
 use super::util::from_wide;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
 pub const KEY_PATH: &str = "Software\\clip4";
@@ -314,6 +316,46 @@ pub fn set_startup(on: bool) {
     }
 }
 
+// ---- Non-blocking mode ----
+//
+// Other programs (Remote Desktop's msrdc.exe, Flow Launcher, ShareX, AutoHotkey, Windows' own
+// services) hold the clipboard open for seconds at a time. In this mode clip4 never waits long for
+// it: a paste gives up after ~0.3 s and types the text, a copy is retried quietly for up to 60 s,
+// and a read that stalls is cut short after 3 s. `--classic` / `--nonblocking` override the setting
+// for one run.
+
+static NONBLOCKING: OnceLock<AtomicBool> = OnceLock::new();
+
+fn mode_from(args: &[String], registry: Option<u32>) -> bool {
+    if args.iter().any(|a| a == "--classic") {
+        return false;
+    }
+    if args.iter().any(|a| a == "--nonblocking") {
+        return true;
+    }
+    registry.is_none_or(|v| v != 0)
+}
+
+fn mode_flag() -> &'static AtomicBool {
+    NONBLOCKING.get_or_init(|| {
+        let args: Vec<String> = std::env::args().collect();
+        let registry = Key::open(&key_path(), false).and_then(|k| k.dword("NonBlocking"));
+        AtomicBool::new(mode_from(&args, registry))
+    })
+}
+
+/// Non-blocking mode is on (the default).
+pub fn nonblocking() -> bool {
+    mode_flag().load(Ordering::Relaxed)
+}
+
+pub fn set_nonblocking(on: bool) {
+    mode_flag().store(on, Ordering::Relaxed);
+    if let Some(k) = Key::create(&key_path()) {
+        k.set_dword("NonBlocking", on as u32);
+    }
+}
+
 // ---- clip2 import (spec 16.6) ----
 
 /// First run only: copies clip2's registry values (same names) and its Snippets subkey.
@@ -346,4 +388,23 @@ pub fn import_clip2() -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::mode_from;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn non_blocking_is_the_default_and_the_switches_win() {
+        assert!(mode_from(&args(&["clip4.exe"]), None), "absent value: on");
+        assert!(mode_from(&args(&["clip4.exe"]), Some(1)));
+        assert!(!mode_from(&args(&["clip4.exe"]), Some(0)), "the setting can turn it off");
+        assert!(!mode_from(&args(&["clip4.exe", "--classic"]), None));
+        assert!(!mode_from(&args(&["clip4.exe", "--classic"]), Some(1)));
+        assert!(mode_from(&args(&["clip4.exe", "--nonblocking"]), Some(0)), "the switch beats the setting");
+    }
 }

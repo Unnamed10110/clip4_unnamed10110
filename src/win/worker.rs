@@ -61,9 +61,30 @@ pub struct Workers {
 /// cannot be cancelled: the only way to make Windows release the clipboard is to end the thread.
 /// A legitimate render of a huge Excel range can take longer; holding everyone's clipboard that long
 /// is worse than skipping that one copy.
-pub const STALL_MS: i64 = 5_000;
-/// Same, when a paste is already waiting for the clipboard.
-pub const PASTE_WAITING_MS: i64 = 750;
+/// Normally 5 s; 3 s in non-blocking mode.
+pub fn stall_ms() -> i64 {
+    stall_for(super::settings::nonblocking())
+}
+/// Same, when a paste is already waiting for the clipboard: 750 ms, 300 ms in non-blocking mode.
+pub fn paste_waiting_ms() -> i64 {
+    paste_wait_for(super::settings::nonblocking())
+}
+
+fn stall_for(nonblocking: bool) -> i64 {
+    if nonblocking {
+        3_000
+    } else {
+        5_000
+    }
+}
+
+fn paste_wait_for(nonblocking: bool) -> i64 {
+    if nonblocking {
+        300
+    } else {
+        750
+    }
+}
 
 fn stalled(since: i64, now: i64, limit: i64) -> bool {
     since != 0 && now - since >= limit
@@ -143,7 +164,7 @@ impl Workers {
     }
 
     pub fn capture(&self, seq: u32) {
-        self.unstick(STALL_MS);
+        self.unstick(stall_ms());
         if let Ok(g) = self.cap.lock() {
             let _ = g.send(CaptureTask::Capture { seq });
         }
@@ -229,6 +250,9 @@ pub fn set_capture_owner(h: SendHwnd) {
 /// `OleFlushClipboard` that needs the clipboard right after the change notification; if we
 /// open it first, that flush fails while we wait on the source's delayed rendering.
 const CAPTURE_SETTLE: std::time::Duration = std::time::Duration::from_millis(25);
+/// Non-blocking mode waits longer, so the other clipboard watchers (Flow Launcher, ShareX,
+/// AutoHotkey, Windows services), which all read right after a change, are done before we start.
+const CAPTURE_SETTLE_NONBLOCKING: std::time::Duration = std::time::Duration::from_millis(150);
 
 fn capture_owner() -> Option<HWND> {
     match CAPTURE_OWNER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -238,7 +262,7 @@ fn capture_owner() -> Option<HWND> {
 }
 
 fn do_capture(blobs: &BlobStore, trigger_seq: u32) {
-    std::thread::sleep(CAPTURE_SETTLE);
+    std::thread::sleep(if super::settings::nonblocking() { CAPTURE_SETTLE_NONBLOCKING } else { CAPTURE_SETTLE });
     match clipboard::capture(capture_owner()) {
         Captured::Busy => {
             post_ui(UiMsg::CaptureBusy { seq: trigger_seq, unreadable: false });
@@ -557,6 +581,12 @@ mod tests {
         });
         assert_eq!(coalesce(&rx, Duration::from_millis(200)), Some(2));
         t.join().unwrap();
+    }
+
+    #[test]
+    fn non_blocking_mode_cuts_stalls_and_paste_waits_shorter() {
+        assert_eq!((stall_for(false), stall_for(true)), (5_000, 3_000));
+        assert_eq!((paste_wait_for(false), paste_wait_for(true)), (750, 300));
     }
 
     #[test]

@@ -98,8 +98,32 @@ it in Settings.
 
 Tray menu -> *Settings*: hotkeys, theme (15 presets), content font and size, UI size, per-element
 colours (click to pick, double-click to reset), history size (10-2000, default 300), expand
-selected item, start with Windows, capture sound, and *Clear history*. Theme, font, size and
-colour changes apply live; hotkeys and history size apply on *Save*.
+selected item, start with Windows, capture sound, non-blocking mode, and *Clear history*. Theme,
+font, size and colour changes apply live; hotkeys and history size apply on *Save*.
+
+### Non-blocking mode (on by default)
+
+Other programs use the clipboard too (Remote Desktop's `msrdc.exe`, Flow Launcher, ShareX,
+AutoHotkey scripts, Windows services) and some hold it open for seconds, or even 30 s: while they do,
+nobody can copy or paste, **with or without clip4**. clip4 cannot take the clipboard away from
+them, but in this mode it never waits long for it and keeps working from its own history:
+
+* **Paste** waits at most ~0.3 s for the clipboard; if it is still held, the item's text is *typed*
+  as keystrokes instead (formatting is lost, line breaks become Enter), so picking an item in the
+  overlay works while the clipboard is blocked. Images and files report "clipboard busy".
+* **Copy**: a copy made while another program holds the clipboard is retried quietly for up to
+  60 s and recorded the moment it is released (classic mode: ~10 s). clip4 waits 150 ms after a
+  change before reading, so the other watchers finish first, and ends a read that stalls after 3 s
+  (a source such as a remote clipboard that does not answer) instead of holding everyone up.
+* The log names the blocker: `clipboard held by msrdc.exe; the capture will retry`, and
+  `capture of sequence N abandoned ...; clipboard holder now: X`.
+
+`--classic` (or the checkbox) switches it off for the old, patient behaviour; `--nonblocking`
+forces it on for one run.
+
+If the log keeps naming `msrdc.exe`: end it in Task Manager to confirm, then turn off clipboard
+redirection for that Remote Desktop / Azure Virtual Desktop connection (Local Resources, or
+`redirectclipboard:i:0` in the `.rdp` file) or update the client; that is the only real cure.
 
 ## Where things live
 

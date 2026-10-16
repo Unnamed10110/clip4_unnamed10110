@@ -151,6 +151,7 @@ const ID_CLEAR: i32 = 241;
 const ID_EXPAND: i32 = 250;
 const ID_STARTUP: i32 = 251;
 const ID_SOUND: i32 = 252;
+const ID_NONBLOCKING: i32 = 253;
 const ID_DEFAULTS: i32 = 260;
 const TIMER_SWATCH: usize = 1;
 const SWATCH_NAMES: [&str; 6] = ["Background", "Text", "Accent", "Selected text", "Border", "Dim"];
@@ -177,6 +178,7 @@ struct SettingsDlg {
     expand: Cell<HWND>,
     startup: Cell<HWND>,
     sound: Cell<HWND>,
+    nonblocking: Cell<HWND>,
     /// Swatch whose first click is waiting to see whether a second one follows.
     pending: Cell<Option<usize>>,
     /// Swatch reset by a double-click, and when.
@@ -248,6 +250,7 @@ impl SettingsDlg {
         self.expand.set(ui.add(h, w!("BUTTON"), "Expand selected item", check, 0, (24, 462, 190, 22), ID_EXPAND));
         self.startup.set(ui.add(h, w!("BUTTON"), "Start with Windows", check, 0, (222, 462, 190, 22), ID_STARTUP));
         self.sound.set(ui.add(h, w!("BUTTON"), "Play capture sound", check, 0, (420, 462, 204, 22), ID_SOUND));
+        self.nonblocking.set(ui.add(h, w!("BUTTON"), "Non-blocking mode", check, 0, (262, 432, 214, 22), ID_NONBLOCKING));
 
         ui.button(h, "Defaults", (12, 502, 100, 28), ID_DEFAULTS, false);
         ui.button(h, "Save", (448, 502, 92, 28), ID_OK, true);
@@ -273,6 +276,7 @@ impl SettingsDlg {
         set_check(self.expand.get(), s.expand_selected);
         set_check(self.sound.get(), s.sound);
         set_check(self.startup.get(), settings::startup_enabled());
+        set_check(self.nonblocking.get(), settings::nonblocking());
         self.refresh_colors(&s);
     }
 
@@ -426,6 +430,7 @@ impl SettingsDlg {
         app.settings.borrow().save();
         set_text(self.hist.get(), &d.max_items.to_string());
         settings::set_startup(false);
+        settings::set_nonblocking(true);
         self.sync(app);
     }
 
@@ -498,6 +503,7 @@ impl Dlg for SettingsDlg {
                         app.settings.borrow().save();
                     }
                     ID_STARTUP => settings::set_startup(is_checked(self.startup.get())),
+                    ID_NONBLOCKING => settings::set_nonblocking(is_checked(self.nonblocking.get())),
                     ID_DEFAULTS => self.defaults(app),
                     ID_CLEAR => self.clear_history(app, h),
                     _ => {}
@@ -570,6 +576,7 @@ pub fn settings_dialog(app: &App) {
         expand: Cell::default(),
         startup: Cell::default(),
         sound: Cell::default(),
+        nonblocking: Cell::default(),
         pending: Cell::new(None),
         reset_at: Cell::new(None),
         custom_colors: Cell::new([COLORREF(0x00FF_FFFF); 16]),

@@ -398,8 +398,8 @@ impl App {
                 c.attempts = 0;
             }
             c.attempts += 1;
-            let Some(d) = capture_retry_delay(c.attempts, unreadable) else {
-                crate::log_warn!("capture of sequence {seq} abandoned after {} attempts", c.attempts - 1);
+            let Some(d) = capture_retry_delay(c.attempts, unreadable, super::settings::nonblocking()) else {
+                crate::log_warn!("capture of sequence {seq} abandoned after {} attempts; clipboard holder now: {}", c.attempts - 1, clipboard::open_owner_name());
                 return;
             };
             c.pending = Some(seq);
@@ -716,7 +716,8 @@ impl App {
                     let _ = KillTimer(Some(hwnd), TIMER_CAPTURE_RETRY);
                     let seq = self.cap.borrow_mut().pending.take();
                     if let Some(s) = seq {
-                        if self.cap.borrow().last_consumed != s {
+                        // A newer copy has its own capture: retrying this one would be stale.
+                        if self.cap.borrow().last_consumed != s && clipboard::sequence() == s {
                             self.workers.capture(s);
                         }
                     }
@@ -733,7 +734,7 @@ impl App {
                 TIMER_GUARD => {
                     let _ = KillTimer(Some(hwnd), TIMER_GUARD);
                     self.guard_armed.set(false);
-                    self.workers.unstick(worker::STALL_MS);
+                    self.workers.unstick(worker::stall_ms());
                     if self.workers.busy() {
                         self.arm_guard();
                     }
@@ -772,15 +773,18 @@ impl App {
 ///   seconds): about 10 s, ramping 50 ms -> 500 ms. Waiting costs nobody anything.
 /// - Data unreadable (the source announced formats but rendered none): 4 quick tries, ~2 s. Each
 ///   try holds the clipboard while the source fails again, which blocks other apps' Ctrl+C.
-pub fn capture_retry_delay(attempt: u32, unreadable: bool) -> Option<u32> {
+pub fn capture_retry_delay(attempt: u32, unreadable: bool, patient: bool) -> Option<u32> {
     if unreadable {
         const QUICK: [u32; 4] = [100, 250, 500, 1000];
         return QUICK.get((attempt.max(1) - 1) as usize).copied();
     }
     const RAMP: [u32; 7] = [50, 100, 150, 200, 300, 400, 500];
+    // Patient (non-blocking mode): keep going for about a minute, so a copy made while another
+    // program holds the clipboard is recorded the moment it lets go. 7 ramp steps + 117 x 500 ms.
+    let last = if patient { 124 } else { 25 };
     match attempt {
         0 => Some(RAMP[0]),
-        1..=25 => Some(RAMP.get(attempt as usize - 1).copied().unwrap_or(500)),
+        a if a <= last => Some(RAMP.get(a as usize - 1).copied().unwrap_or(500)),
         _ => None,
     }
 }
@@ -880,18 +884,29 @@ mod tests {
 
     #[test]
     fn capture_retry_schedule_ramps_then_gives_up_after_about_ten_seconds() {
-        assert_eq!(capture_retry_delay(1, false), Some(50));
-        assert_eq!(capture_retry_delay(2, false), Some(100));
-        assert_eq!(capture_retry_delay(7, false), Some(500));
-        assert_eq!(capture_retry_delay(25, false), Some(500));
-        assert_eq!(capture_retry_delay(26, false), None);
-        let total: u32 = (1..=25).filter_map(|a| capture_retry_delay(a, false)).sum();
+        assert_eq!(capture_retry_delay(1, false, false), Some(50));
+        assert_eq!(capture_retry_delay(2, false, false), Some(100));
+        assert_eq!(capture_retry_delay(7, false, false), Some(500));
+        assert_eq!(capture_retry_delay(25, false, false), Some(500));
+        assert_eq!(capture_retry_delay(26, false, false), None);
+        let total: u32 = (1..=25).filter_map(|a| capture_retry_delay(a, false, false)).sum();
         assert!((9_000..=12_000).contains(&total), "total retry window {total} ms");
     }
 
     #[test]
+    fn patient_capture_retries_for_about_a_minute() {
+        assert_eq!(capture_retry_delay(1, false, true), Some(50));
+        assert_eq!(capture_retry_delay(124, false, true), Some(500));
+        assert_eq!(capture_retry_delay(125, false, true), None);
+        let total: u32 = (1..=124).filter_map(|a| capture_retry_delay(a, false, true)).sum();
+        assert!((55_000..=65_000).contains(&total), "total retry window {total} ms");
+        // Unreadable data keeps its short schedule in both modes.
+        assert_eq!((1..=10).filter_map(|a| capture_retry_delay(a, true, true)).count(), 4);
+    }
+
+    #[test]
     fn unreadable_data_is_retried_only_briefly() {
-        let delays: Vec<u32> = (1..=10).filter_map(|a| capture_retry_delay(a, true)).collect();
+        let delays: Vec<u32> = (1..=10).filter_map(|a| capture_retry_delay(a, true, false)).collect();
         assert_eq!(delays, vec![100, 250, 500, 1000]);
     }
 }

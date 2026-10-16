@@ -24,10 +24,18 @@ pub const MAX_FORMAT_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_PRIMARY_IMAGE_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_ITEM_BYTES: usize = 10 * 1024 * 1024;
 
-/// Writes (paste, restore, backup, snippet `{{clipboard}}`) keep trying ~1.5 s: another clipboard
-/// watcher (Flow Launcher, ShareX, ...) may be reading right after every change.
-const WRITE_TRIES: u32 = 100;
+/// Writes (paste, restore, backup, snippet `{{clipboard}}`) keep trying: another clipboard watcher
+/// (Flow Launcher, ShareX, ...) may be reading right after every change. About 1.5 s normally; in
+/// non-blocking mode about 0.3 s, after which the paste types the text instead (`paste.rs`).
 const WRITE_GAP_MS: u64 = 15;
+
+fn write_tries(nonblocking: bool) -> u32 {
+    if nonblocking {
+        20
+    } else {
+        100
+    }
+}
 
 /// Open clipboard; closing is `Drop`, so no return path can leave it locked.
 pub struct ClipboardGuard(());
@@ -59,8 +67,15 @@ pub fn open(owner: Option<HWND>, attempts: u32, delay_ms: u64) -> Option<Clipboa
 
 /// How long the content owner gets to answer a `WM_NULL` before we call it unresponsive.
 const PROBE_MS: u32 = 250;
+
 /// A paste that cannot get the clipboard for this long asks to have our own stuck readers cut short.
-const UNSTICK_AFTER_MS: u64 = 600;
+fn unstick_after_ms(nonblocking: bool) -> u64 {
+    if nonblocking {
+        150
+    } else {
+        600
+    }
+}
 
 /// The clipboard owner cannot answer messages right now (busy or hung), so asking it to render
 /// data would block us, holding the clipboard for everyone, until it does. Nothing is locked here.
@@ -94,24 +109,40 @@ fn held_by_us() -> bool {
     }
 }
 
-/// `open` for writes and paste-time reads (~1.5 s of retries). If our own capture thread is the one
-/// holding the clipboard, it is cut short after `UNSTICK_AFTER_MS` instead of making the paste fail.
+/// `open` for writes and paste-time reads (`write_tries` x `WRITE_GAP_MS`). If our own capture thread
+/// is the one holding the clipboard, it is cut short (`unstick_after_ms`) instead of making the
+/// paste fail.
 fn open_for_write(owner: HWND) -> Option<ClipboardGuard> {
+    let nb = super::settings::nonblocking();
+    let tries = write_tries(nb);
     let mut asked = false;
-    for i in 0..WRITE_TRIES {
+    for i in 0..tries {
         // SAFETY: OpenClipboard has no memory-safety preconditions.
         if unsafe { OpenClipboard(Some(owner)) }.is_ok() {
             return Some(ClipboardGuard(()));
         }
-        if i + 1 < WRITE_TRIES {
-            if !asked && u64::from(i) * WRITE_GAP_MS >= UNSTICK_AFTER_MS && held_by_us() {
+        if i + 1 < tries {
+            if !asked && u64::from(i) * WRITE_GAP_MS >= unstick_after_ms(nb) && held_by_us() {
                 asked = true;
-                super::worker::unstick(super::worker::PASTE_WAITING_MS);
+                super::worker::unstick(super::worker::paste_waiting_ms());
             }
             sleep_pump(WRITE_GAP_MS);
         }
     }
     None
+}
+
+/// The clipboard is held by someone else and a capture cannot start. A long hold is retried twice a
+/// second, so the holder is named at INFO once per 5 s and at debug level otherwise.
+fn note_busy_holder() {
+    static LAST_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = super::util::now_unix_ms();
+    if now - LAST_MS.load(std::sync::atomic::Ordering::Relaxed) >= 5_000 {
+        LAST_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+        crate::log_info!("clipboard held by {}; the capture will retry", open_owner_name());
+    } else {
+        crate::log_dbg!("clipboard still held by {}", open_owner_name());
+    }
 }
 
 /// The clipboard holds at least one format. No lock needed.
@@ -638,7 +669,7 @@ fn capture_impl(owner: Option<HWND>, allow_ole: bool, stage: Stage) -> (Captured
         return (if matches!(stage, Stage::First) { Captured::Busy } else { Captured::Empty(sequence()) }, false);
     }
     let Some(guard) = open(owner, 8, 5) else {
-        crate::log_warn!("OpenClipboard failed after 8 attempts (capture); owner = {}", open_owner_name());
+        note_busy_holder();
         return (Captured::Busy, false);
     };
     let t0 = Instant::now();
@@ -1017,6 +1048,14 @@ mod tests {
         let (first, rest) = split(&[0xC012, 0xC013], &n);
         assert_eq!(first, vec![vec![0xC012], vec![0xC013]]);
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn non_blocking_mode_gives_up_on_a_write_after_about_a_third_of_a_second() {
+        assert_eq!(u64::from(write_tries(false)) * WRITE_GAP_MS, 1500);
+        assert_eq!(u64::from(write_tries(true)) * WRITE_GAP_MS, 300);
+        assert!(unstick_after_ms(true) < unstick_after_ms(false));
+        assert!(unstick_after_ms(true) < u64::from(write_tries(true)) * WRITE_GAP_MS, "the unstick request comes before the paste gives up");
     }
 
     #[test]
